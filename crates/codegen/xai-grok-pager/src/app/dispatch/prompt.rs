@@ -14,7 +14,7 @@ use super::session::fork::open_project_question;
 use super::session::lifecycle::skip_picker_and_create_session;
 use super::voice::{merge_prompt_with_voice_interim, voice_stop_on_submit};
 use crate::app::actions::{Action, DoctorFixTarget, Effect};
-use crate::app::agent::{AgentId, AgentState};
+use crate::app::agent::{AgentCommand, AgentId, AgentState};
 use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView};
 use crate::notifications::{NotificationEvent, NotificationEventKind};
@@ -467,6 +467,7 @@ pub(super) fn dispatch_send_prompt_inner(
     };
     // Capture app-level fields before the mut-borrow on `agent`.
     let coding_data_sharing_opt_out_from_app = app.coding_data_retention_opt_out;
+    let coding_data_sharing_lock_from_app = app.coding_data_sharing_lock();
     let show_tips_from_app = app.show_tips;
     let auto_update_from_app = app.auto_update;
     let respect_manual_folds_from_app = app.appearance.scrollback.scroll.respect_manual_folds;
@@ -476,6 +477,7 @@ pub(super) fn dispatch_send_prompt_inner(
     // shown after the agent borrow ends so we can re-enter via the tip helper.
     let mut tip_send_now_after_queue = false;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let scheduler_background_loops_seed = app.scheduler_background_loops_seed;
     let login_method_id_from_app = app.login_method_id.as_ref().map(|id| id.0.to_string());
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
@@ -549,6 +551,7 @@ pub(super) fn dispatch_send_prompt_inner(
                 bundle_state: &app.bundle_state,
                 screen_mode: app.screen_mode,
                 billing_surface_visible: app.usage_visible,
+                usage_command_visible: !app.has_external_auth_provider,
                 // PAGER-owned snapshot for slash commands.
                 pager_state: crate::settings::PagerLocalSnapshot {
                     multiline_mode: agent.multiline_mode,
@@ -563,6 +566,7 @@ pub(super) fn dispatch_send_prompt_inner(
                         .map(|(id, info)| (info.name.clone(), id.clone()))
                         .collect(),
                     coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
+                    coding_data_sharing_lock: coding_data_sharing_lock_from_app,
                     // Prefer optimistic pending over confirmed active.
                     plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
                     show_tips: show_tips_from_app,
@@ -573,6 +577,11 @@ pub(super) fn dispatch_send_prompt_inner(
                     auto_mode_gate: auto_mode_gate_from_app,
                     ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                     voice_stt_language: voice_stt_language_from_app,
+                    // This session's own value (what its fires will actually
+                    // do), seed only until the session response lands.
+                    scheduler_background_loops: agent
+                        .scheduler_background_loops
+                        .unwrap_or(scheduler_background_loops_seed),
                 },
             };
 
@@ -599,15 +608,15 @@ pub(super) fn dispatch_send_prompt_inner(
                     });
                 }
                 if let Some(command) = command {
-                    if ctx.screen_mode.is_minimal() && !command.available_in_minimal() {
-                        // Central minimal gate: commands that drive the deleted
-                        // fullscreen pane / dashboard (/find, /dashboard, …)
-                        // have nothing to act on in scrollback-native mode.
-                        // Surface a friendly system block instead of running them.
-                        CommandResult::Message(format!(
-                            "/{} is not available in minimal mode",
-                            invocation.token
-                        ))
+                    // Central screen-mode gate. Such a command is already
+                    // filtered out of every completion surface, but it stays
+                    // resolvable so a fully-typed invocation earns a hint that
+                    // names the way out instead of leaking to the model.
+                    if let Some(refusal) = command
+                        .mode_support()
+                        .refusal(invocation.token, ctx.screen_mode)
+                    {
+                        CommandResult::Message(refusal)
                     } else {
                         agent
                             .prompt
@@ -845,7 +854,6 @@ pub(super) fn dispatch_send_prompt_inner(
 
             if parked_sendable_wait && !hold_behind_existing_queue {
                 agent.arm_send_now_expectation(prompt_id.clone());
-                agent.suppress_parked_marker_on_interject();
             }
 
             if consume_input {
@@ -1606,10 +1614,23 @@ pub(super) fn handle_compact_complete(
     result: Result<(), String>,
 ) -> Vec<Effect> {
     if let Some(agent) = app.agents.get_mut(&agent_id) {
-        // Defensive: only process if we're still in CommandRunning state.
-        // This guards against state machine bugs or future cancellation support.
-        if !matches!(agent.session.state, AgentState::CommandRunning { .. }) {
-            tracing::debug!("Ignoring CompactComplete (not in CommandRunning state)");
+        // Defensive: only process if we're still in a compact command state.
+        let was_cancelling = matches!(
+            agent.session.state,
+            AgentState::CommandCancelling {
+                command: AgentCommand::Compact,
+            }
+        );
+        if !matches!(
+            agent.session.state,
+            AgentState::CommandRunning {
+                command: AgentCommand::Compact,
+                ..
+            } | AgentState::CommandCancelling {
+                command: AgentCommand::Compact,
+            }
+        ) {
+            tracing::debug!("Ignoring CompactComplete (not in compact command state)");
             return vec![];
         }
 
@@ -1622,6 +1643,11 @@ pub(super) fn handle_compact_complete(
                     SessionEvent::CompactCompleted {
                         elapsed: elapsed.unwrap_or_default(),
                     },
+                ));
+            }
+            Err(err) if was_cancelling || err.contains("compact cancelled") => {
+                agent.scrollback.push_block(RenderBlock::session_event(
+                    SessionEvent::CompactionCancelled,
                 ));
             }
             Err(err) => {

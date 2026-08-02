@@ -889,7 +889,7 @@ pub(super) async fn run_session(
                                     // Cap to prevent unbounded growth during long tool calls.
                                     const MAX_BUFFER_EVENTS: usize = 50;
                                     buffer.push_capped(
-                                        xai_grok_tools::implementations::grok_build::task::types::MonitorEventNotification {
+                                        xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventNotification {
                                             task_id: task_id.clone(),
                                             event_text,
                                             // Tag with this session's id so the
@@ -1446,11 +1446,16 @@ pub(super) async fn run_session(
 
                             let session_for_mcp = session.clone();
                             let sname = server_name.clone();
+                            let session_cwd = session.session_info.cwd.clone();
                             tokio::task::spawn_local(async move {
                                 session_for_mcp.ensure_mcp_tools_initialized().await;
-                                if let Err(e) = crate::util::config::save_mcp_server_enabled(
-                                    &sname, enabled,
-                                ).await {
+                                if let Err(e) = crate::util::config::save_mcp_server_enabled_in(
+                                    &sname,
+                                    enabled,
+                                    std::path::Path::new(&session_cwd),
+                                )
+                                .await
+                                {
                                     tracing::warn!(
                                         server = sname.as_str(),
                                         error = %e,
@@ -1778,8 +1783,7 @@ pub(super) async fn run_session(
                                 .send((availability.workflows, availability.workflow_management));
                         }
                         SessionCommand::ListAvailableCommands { respond_to } => {
-                            let bridge = session.agent.borrow().tool_bridge().clone();
-                            let skills = bridge.slash_skills().await;
+                            let skills = session.slash_skills_for_resolve().await;
                             let tool_names = session.registered_tool_names().await;
                             let has_runs = !session.workflow_tracker().await.lock().list().is_empty();
                             let availability =

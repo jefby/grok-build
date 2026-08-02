@@ -73,6 +73,14 @@ pub struct BtwEntry {
     /// Error message if failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Model-call attempts made (1 = no retry). Entries written before this
+    /// field existed deserialize as 1.
+    #[serde(default = "default_btw_attempts")]
+    pub attempts: u32,
+}
+
+fn default_btw_attempts() -> u32 {
+    1
 }
 
 // Local feedback persistence types
@@ -372,6 +380,11 @@ pub enum PersistenceMsg {
     /// Routed back through the persistence channel so the storage write
     /// stays sequential with other summary.json mutations.
     GeneratedTitle(String),
+    /// Enable remote writeback for a session created `Local` before remote
+    /// settings resolved (non-blocking startup); backfills its local history.
+    UpgradeToWriteback {
+        auth_manager: Arc<crate::auth::AuthManager>,
+    },
     Flush,
     /// Flush all pending writes, then signal the caller once the flush is complete.
     /// Unlike `Flush` (fire-and-forget), this is a **sync barrier**: the caller's
@@ -1498,6 +1511,17 @@ pub struct PersistenceHandle {
     noop: bool,
 }
 
+fn actor_channel() -> (
+    PersistenceHandle,
+    mpsc::UnboundedReceiver<PersistenceMsg>,
+    mpsc::WeakUnboundedSender<PersistenceMsg>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let weak = tx.downgrade();
+    let handle = PersistenceHandle { tx, noop: false };
+    (handle, rx, weak)
+}
+
 #[derive(Debug)]
 pub enum DurableAppendError {
     NotCommitted(io::Error),
@@ -1591,6 +1615,9 @@ struct SessionPersistence {
     pending_notification: Option<acp::SessionNotification>,
     rx: mpsc::UnboundedReceiver<PersistenceMsg>,
     remote_sync: Option<RemoteSync>,
+    /// True only for sessions created this run (not resumed); gates the
+    /// writeback backfill so a resumed, already-synced session isn't re-sent.
+    created_fresh: bool,
     /// WebSocket-based relay sync for real-time session sharing.
     /// This streams updates to the relay backend in addition to local persistence.
     relay_sync: Option<crate::relay::RelaySync>,
@@ -1710,6 +1737,53 @@ impl SessionPersistence {
         }
     }
 
+    /// Enable writeback for a session created `Local` before settings resolved:
+    /// build the sync and (for a fresh session) backfill its local-only history.
+    /// No-op once syncing, so a repeat upgrade is harmless.
+    async fn upgrade_to_writeback(&mut self, auth_manager: Arc<crate::auth::AuthManager>) {
+        if self.remote_sync.is_some() {
+            return;
+        }
+        // Flush the merge-pending notification so the backfill re-reads it.
+        self.flush_pending().await;
+        let persisted = match self.storage.load_session(&self.info).await {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                tracing::warn!(%error, "writeback upgrade: failed to load session for backfill");
+                return;
+            }
+        };
+        let remote_sync = match init_remote_sync(
+            &persisted.summary,
+            StorageMode::Writeback,
+            Some(auth_manager),
+        ) {
+            Ok(Some(remote_sync)) => remote_sync,
+            // ZDR team, or nothing to do: leave the session local-only.
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "writeback upgrade: remote sync init failed");
+                return;
+            }
+        };
+        // Fresh-only backfill; see `backfill_updates_to_sync`.
+        let backfilled =
+            backfill_updates_to_sync(self.created_fresh, persisted.updates, &remote_sync);
+        if self.created_fresh {
+            tracing::info!(
+                session_id = %self.info.id,
+                backfilled,
+                "writeback enabled after settings arrival; backfilled local-only history",
+            );
+        } else {
+            tracing::info!(
+                session_id = %self.info.id,
+                "writeback enabled for resumed session; forward-only, no backfill",
+            );
+        }
+        self.remote_sync = Some(remote_sync);
+    }
+
     fn finish_pending_append(
         notification: acp::SessionNotification,
         result: Result<(), crate::session::storage::AppendUpdateError>,
@@ -1806,6 +1880,9 @@ impl SessionPersistence {
                 spawn_worktree_touch(&self.info);
             }
             match msg {
+                PersistenceMsg::UpgradeToWriteback { auth_manager } => {
+                    self.upgrade_to_writeback(auth_manager).await;
+                }
                 PersistenceMsg::Flush => {
                     self.flush_pending().await;
                 }
@@ -2239,6 +2316,29 @@ fn collect_session_files_recursive(base: &Path, dir: &Path, files: &mut Vec<Copi
     }
 }
 
+/// Queue a fresh session's local-only ACP history to `remote_sync` (xAI updates
+/// are never synced), returning the count. Resumed sessions are forward-only:
+/// their prior history may already be on the backend (which appends by content,
+/// no per-message id), so re-sending would duplicate.
+fn backfill_updates_to_sync(
+    created_fresh: bool,
+    updates: Vec<SessionUpdate>,
+    remote_sync: &RemoteSync,
+) -> usize {
+    if !created_fresh {
+        return 0;
+    }
+    let mut backfilled = 0usize;
+    for update in updates {
+        if let SessionUpdate::Acp(notification) = update {
+            remote_sync.queue(*notification);
+            backfilled += 1;
+        }
+    }
+    remote_sync.flush();
+    backfilled
+}
+
 fn init_remote_sync(
     summary: &Summary,
     storage_mode: StorageMode,
@@ -2415,16 +2515,11 @@ pub(crate) async fn new(
         summary.current_model_id = model_id;
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let (handle, rx, summary_tx) = actor_channel();
 
     let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let remote_sync = init_remote_sync(&summary, storage_mode, auth_manager)?;
-    let handle = PersistenceHandle {
-        tx: tx.clone(),
-        noop: false,
-    };
-
     tokio::task::spawn(async move {
         let persistence = SessionPersistence {
             info: info_clone,
@@ -2432,12 +2527,13 @@ pub(crate) async fn new(
             pending_notification: None,
             rx,
             remote_sync: remote_sync.clone(),
+            created_fresh: true,
             relay_sync,
             summary: crate::session::summary::SummaryGenerator::new(
                 crate::session::summary::SummaryConfig {
                     sampling_client,
                     model: session_summary_model,
-                    persistence_tx: tx,
+                    persistence_tx: summary_tx,
                 },
             ),
             registry_title_sync,
@@ -2486,15 +2582,10 @@ pub async fn new_with_explicit_dir(
         summary.current_model_id = model_id;
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let (handle, rx, summary_tx) = actor_channel();
 
     let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
-    let handle = PersistenceHandle {
-        tx: tx.clone(),
-        noop: false,
-    };
-
     tokio::task::spawn(async move {
         let persistence = SessionPersistence {
             info: info_clone,
@@ -2502,12 +2593,13 @@ pub async fn new_with_explicit_dir(
             pending_notification: None,
             rx,
             remote_sync: None,
+            created_fresh: false,
             relay_sync: None,
             summary: crate::session::summary::SummaryGenerator::new(
                 crate::session::summary::SummaryConfig {
                     sampling_client,
                     model: session_summary_model,
-                    persistence_tx: tx,
+                    persistence_tx: summary_tx,
                 },
             ),
             registry_title_sync: None,
@@ -2603,22 +2695,18 @@ pub(crate) async fn load(
         workflow_runs: persisted.workflow_runs,
     };
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let (handle, rx, summary_tx) = actor_channel();
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;
 
     let has_title = !persisted_info.summary.display_title().is_empty();
-    let handle = PersistenceHandle {
-        tx: tx.clone(),
-        noop: false,
-    };
     tokio::task::spawn(async move {
         let mut summary_gen = crate::session::summary::SummaryGenerator::new(
             crate::session::summary::SummaryConfig {
                 sampling_client,
                 model: session_summary_model,
-                persistence_tx: tx,
+                persistence_tx: summary_tx,
             },
         );
         if has_title {
@@ -2630,6 +2718,7 @@ pub(crate) async fn load(
             pending_notification: None,
             rx,
             remote_sync: remote_sync.clone(),
+            created_fresh: false,
             relay_sync,
             summary: summary_gen,
             registry_title_sync,
@@ -2689,22 +2778,18 @@ pub(crate) async fn load_light(
         workflow_runs: persisted.workflow_runs,
     };
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let (handle, rx, summary_tx) = actor_channel();
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;
 
     let has_title = !persisted_info.summary.display_title().is_empty();
-    let handle = PersistenceHandle {
-        tx: tx.clone(),
-        noop: false,
-    };
     tokio::task::spawn(async move {
         let mut summary_gen = crate::session::summary::SummaryGenerator::new(
             crate::session::summary::SummaryConfig {
                 sampling_client,
                 model: session_summary_model,
-                persistence_tx: tx,
+                persistence_tx: summary_tx,
             },
         );
         if has_title {
@@ -2716,6 +2801,7 @@ pub(crate) async fn load_light(
             pending_notification: None,
             rx,
             remote_sync: remote_sync.clone(),
+            created_fresh: false,
             relay_sync,
             summary: summary_gen,
             registry_title_sync,
@@ -4524,6 +4610,27 @@ mod repo_wide_resolution_tests {
         assert_eq!(
             deser.resolution_kind,
             LocalSessionResolutionKind::SameRepoDifferentCwd
+        );
+    }
+}
+
+#[cfg(test)]
+mod actor_lifetime_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_the_session_handle_closes_the_actor_channel() {
+        let (handle, mut rx, summary_tx) = actor_channel();
+
+        drop(handle);
+
+        assert!(
+            summary_tx.upgrade().is_none(),
+            "the generator's sender must not keep the channel open"
+        );
+        assert!(
+            rx.recv().await.is_none(),
+            "the actor's receive loop must end once the session drops its handle"
         );
     }
 }

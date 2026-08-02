@@ -15,6 +15,7 @@ pub mod diag_server;
 pub mod discovery;
 pub mod envrc;
 pub mod error;
+pub mod export_github;
 pub mod file_system;
 pub mod folder_trust;
 pub mod foreign_sessions;
@@ -182,7 +183,7 @@ mod init_metrics_tests {
         ));
         assert!(has(
             "grok_workspace_rpc_errors_total",
-            &[("method", "unknown"), ("error_kind", "hub_error")]
+            &[("method", "unknown"), ("error_kind", "unknown_method")]
         ));
         for stage in [
             "startup_recovery",

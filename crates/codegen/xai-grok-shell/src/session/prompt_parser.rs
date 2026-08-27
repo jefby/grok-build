@@ -37,13 +37,6 @@ impl ParsedPrompt {
             self.is_cursor,
         )
     }
-    /// Assemble context and query into the final message string.
-    ///
-    /// Legacy entry point — delegates to [`assemble_parts_with_skills`] with
-    /// no skill information.
-    pub fn assemble_parts(context: &str, query: &str, is_cursor: bool) -> String {
-        Self::assemble_parts_with_skills(context, query, "", is_cursor)
-    }
     /// Assemble context, query, and skill information into the final message string.
     ///
     /// Layout:
@@ -91,6 +84,7 @@ pub async fn parse_prompt(
         prompt,
         working_directory,
         _session_info,
+        super::InputAuthority::HumanIntent,
         verbatim,
         is_cursor,
         String::new(),
@@ -101,14 +95,16 @@ pub async fn parse_prompt(
 ///
 /// This is the full-featured entry point. `parse_prompt` delegates here with
 /// an empty `skill_information` string for backward compatibility.
-pub async fn parse_prompt_with_skills(
+pub(crate) async fn parse_prompt_with_skills(
     prompt: &[acp::ContentBlock],
     working_directory: PathBuf,
     _session_info: &crate::session::info::Info,
+    authority: super::InputAuthority,
     verbatim: bool,
     is_cursor: bool,
     skill_information: String,
 ) -> Result<ParsedPrompt, acp::Error> {
+    let allows_file_expansion = authority != super::InputAuthority::ModelAuthoredUntrusted;
     let mut message_parts: Vec<String> = Vec::new();
     let mut image_parts = Vec::new();
     let mut resource_links = Vec::new();
@@ -119,7 +115,7 @@ pub async fn parse_prompt_with_skills(
             acp::ContentBlock::Image(image_content) => image_parts.push(image_content.clone()),
             acp::ContentBlock::ResourceLink(link) => {
                 resource_links.push(link.clone());
-                if link.meta.is_none() {
+                if allows_file_expansion && link.meta.is_none() {
                     let path = extract_path_from_uri(link);
                     message_parts.push(format!("@{path}"));
                 }
@@ -132,7 +128,11 @@ pub async fn parse_prompt_with_skills(
         }
     }
     let message = message_parts.join(" ");
-    let file_ref_tokens = collect_file_references(&message);
+    let file_ref_tokens = if allows_file_expansion {
+        collect_file_references(&message)
+    } else {
+        Vec::new()
+    };
     let mut file_ref_contents = Vec::new();
     for token in file_ref_tokens {
         let Some(mut file_ref) = FileReference::parse(&token) else {
@@ -220,9 +220,20 @@ fn collect_file_references(message: &str) -> Vec<String> {
         let Some(at_symbol_offset) = message[i..].find('@') else {
             break;
         };
-        let start = i + at_symbol_offset + 1;
-        if start >= message.len() || !message.is_char_boundary(start) {
+        let at = i + at_symbol_offset;
+        if !message.is_char_boundary(at) {
+            i = at.saturating_add(1);
+            continue;
+        }
+        let start = at + '@'.len_utf8();
+        if start > message.len() || !message.is_char_boundary(start) {
             break;
+        }
+        if let Some(ch) = message[..at].chars().next_back()
+            && (ch.is_alphanumeric() || ch == '_')
+        {
+            i = start;
+            continue;
         }
         let rest = &message[start..];
         let token = rest.split_whitespace().next().unwrap_or("");
@@ -230,6 +241,9 @@ fn collect_file_references(message: &str) -> Vec<String> {
             paths.push(token.to_string());
         }
         i = start + token.len().max(1);
+        while i < message.len() && !message.is_char_boundary(i) {
+            i += 1;
+        }
     }
     paths
 }
@@ -418,6 +432,16 @@ mod tests {
         let tokens = collect_file_references("@a.rs @b.rs");
         assert_eq!(tokens, vec!["a.rs", "b.rs"]);
     }
+    #[test]
+    fn test_collect_skips_email_addresses() {
+        let tokens = collect_file_references("email foo@bar.com and also @src/main.rs");
+        assert_eq!(tokens, vec!["src/main.rs"]);
+    }
+    #[test]
+    fn test_collect_email_and_at_ref_with_multibyte() {
+        let tokens = collect_file_references("連絡先 foo@bar.com と @src/main.rs を見て");
+        assert_eq!(tokens, vec!["src/main.rs"]);
+    }
     fn make_link(meta: Option<serde_json::Value>) -> acp::ResourceLink {
         let mut link = acp::ResourceLink::new("test.rs", "file:///project/test.rs");
         if let Some(m) = meta.and_then(|v| v.as_object().cloned()) {
@@ -427,10 +451,11 @@ mod tests {
     }
     #[test]
     fn test_parse_editor_meta_focused_with_cursor() {
-        let link = make_link(Some(serde_json::json!(
-            { "source" : "editor", "fileState" : "focused", "cursor" : { "line" :
-            10, "column" : 3 } }
-        )));
+        let link = make_link(Some(serde_json::json!({
+            "source": "editor",
+            "fileState": "focused",
+            "cursor": { "line": 10, "column": 3 }
+        })));
         let meta = parse_editor_meta(&link).expect("should parse");
         assert!(matches!(
             meta.file_state,
@@ -444,24 +469,27 @@ mod tests {
     }
     #[test]
     fn test_parse_editor_meta_focused_without_cursor_fails() {
-        let link = make_link(Some(
-            serde_json::json!({ "source" : "editor", "fileState" : "focused" }),
-        ));
+        let link = make_link(Some(serde_json::json!({
+            "source": "editor",
+            "fileState": "focused"
+        })));
         assert!(parse_editor_meta(&link).is_none());
     }
     #[test]
     fn test_parse_editor_meta_open() {
-        let link = make_link(Some(
-            serde_json::json!({ "source" : "editor", "fileState" : "open" }),
-        ));
+        let link = make_link(Some(serde_json::json!({
+            "source": "editor",
+            "fileState": "open"
+        })));
         let meta = parse_editor_meta(&link).expect("should parse");
         assert!(matches!(meta.file_state, FileState::Open));
     }
     #[test]
     fn test_parse_editor_meta_non_editor_source_returns_none() {
-        let link = make_link(Some(serde_json::json!(
-            { "source" : "something_else", "fileState" : "focused" }
-        )));
+        let link = make_link(Some(serde_json::json!({
+            "source": "something_else",
+            "fileState": "focused"
+        })));
         assert!(parse_editor_meta(&link).is_none());
     }
     #[test]
@@ -471,10 +499,78 @@ mod tests {
     }
     #[test]
     fn test_parse_editor_meta_unknown_file_state_returns_none() {
-        let link = make_link(Some(
-            serde_json::json!({ "source" : "editor", "fileState" : "minimized" }),
-        ));
+        let link = make_link(Some(serde_json::json!({
+            "source": "editor",
+            "fileState": "minimized"
+        })));
         assert!(parse_editor_meta(&link).is_none());
+    }
+    #[tokio::test]
+    async fn test_runtime_control_prompt_expands_file_references() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("status.log"), "RUNTIME_FILE_MARKER").unwrap();
+        let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+            "inspect @status.log",
+        ))];
+        let info = crate::session::info::Info {
+            id: agent_client_protocol::SessionId::new("test"),
+            cwd: dir.path().display().to_string(),
+        };
+        let parsed = parse_prompt_with_skills(
+            &blocks,
+            dir.path().to_path_buf(),
+            &info,
+            super::super::InputAuthority::RuntimeControl,
+            false,
+            false,
+            String::new(),
+        )
+        .await
+        .unwrap();
+        assert!(parsed.assemble().contains("RUNTIME_FILE_MARKER"));
+    }
+    #[tokio::test]
+    async fn test_model_authored_prompt_does_not_expand_file_references() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "TEXT_SECRET_MARKER").unwrap();
+        std::fs::write(dir.path().join("linked-secret.txt"), "LINK_SECRET_MARKER").unwrap();
+        let blocks = vec![
+            acp::ContentBlock::Text(acp::TextContent::new("inspect @secret.txt")),
+            acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                "linked-secret.txt",
+                "file://linked-secret.txt",
+            )),
+        ];
+        let info = crate::session::info::Info {
+            id: agent_client_protocol::SessionId::new("test"),
+            cwd: dir.path().display().to_string(),
+        };
+        let parsed = parse_prompt_with_skills(
+            &blocks,
+            dir.path().to_path_buf(),
+            &info,
+            super::super::InputAuthority::ModelAuthoredUntrusted,
+            false,
+            false,
+            String::new(),
+        )
+        .await
+        .unwrap();
+        let assembled = parsed.assemble();
+        assert!(parsed.query.contains("inspect @secret.txt"));
+        assert!(!parsed.query.contains("@linked-secret.txt"));
+        assert!(assembled.contains("file://linked-secret.txt"));
+        for forbidden in [
+            "TEXT_SECRET_MARKER",
+            "LINK_SECRET_MARKER",
+            "<attached_files>",
+            "<file_contents",
+        ] {
+            assert!(
+                !assembled.contains(forbidden),
+                "unexpected {forbidden}: {assembled}"
+            );
+        }
     }
     #[test]
     fn test_grok_render_plain_message() {

@@ -3,9 +3,11 @@
 //! parse-error formatting.
 
 use super::*;
+use std::path::PathBuf;
 
 /// Number of output lines to show in final bash mode output summary
 const BASH_MODE_FINAL_OUTPUT_LINES: usize = 10;
+const BASH_MODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Phase 2: dispatch a tool call through [`WorkspaceOps::call_tool`].
 ///
@@ -47,27 +49,58 @@ fn str_arg<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
 /// - `path` — alternate edit/read tools
 /// - `target_file` — grok_build (`read_file`, via `#[serde(rename)]`)
 ///
-/// Returning the same string for two calls in a batch causes them to share a
+/// Returning the same key for two calls in a batch causes them to share a
 /// `tokio::sync::Mutex` and therefore run sequentially in model-emitted order.
 /// Returning `None` lets the call run fully concurrently with everything else.
 ///
 /// `target_directory` is deliberately omitted — a directory listing isn't an
 /// edit and must not bucket into a file lock.
-pub(super) fn lock_path_for_args(args: &serde_json::Value) -> Option<&str> {
-    str_arg(args, &["file_path", "path", "target_file"])
+pub(super) fn lock_path_for_args(args: &serde_json::Value, cwd: &Path) -> Option<String> {
+    let input = Path::new(str_arg(args, &["file_path", "path", "target_file"])?);
+    let absolute = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        cwd.join(input)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    let lock_path = canonicalize_existing_ancestor(&normalized).unwrap_or(normalized);
+    Some(lock_path.to_string_lossy().into_owned())
+}
+
+fn canonicalize_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = dunce::canonicalize(ancestor) {
+            suffix.reverse();
+            canonical.extend(suffix);
+            return Some(canonical);
+        }
+        suffix.push(ancestor.file_name()?.to_owned());
+        ancestor = ancestor.parent()?;
+    }
 }
 
 /// Pull the path a read/list tool targets and classify it against the store.
 /// Keys span harnesses: `read_file`=`target_file`, grep=`path`,
-/// `list_dir`=`target_directory`. Grammar lives in `xai_chat_state`.
+/// `list_dir`=`target_directory`. Grammar lives in `xai_compaction_transcript`.
 pub(super) fn compaction_artifact_read(
     args: &serde_json::Value,
-) -> Option<xai_chat_state::compaction_transcript::CompactionArtifact> {
+) -> Option<xai_compaction_transcript::CompactionArtifact> {
     let path = str_arg(
         args,
         &["target_file", "file_path", "path", "target_directory"],
     )?;
-    xai_chat_state::compaction_transcript::classify_compaction_path(path)
+    xai_compaction_transcript::classify_compaction_path(path)
 }
 
 /// Map a backend-hosted tool name to a user-facing title, ACP ToolKind,
@@ -96,9 +129,37 @@ pub(super) fn backend_tool_display(name: &str) -> (String, acp::ToolKind, serde_
     }
 }
 
-/// Temporary gate: only expose resolved model ID to the user for these models.
-pub(super) fn should_show_resolved_model(requested: &str, resolved: &str) -> bool {
-    requested != resolved && super::acp_types::is_coding_model_slug(requested)
+/// Map a completed backend (server-side) tool call's payload to the ACP terminal
+/// status the shell should emit. The backend reports each call's real
+/// success/failure in the serialized payload's top-level `status` field (e.g. a
+/// `web_search_call`'s `WebSearchToolCallStatus`, which includes `failed`); a
+/// `"failed"` status becomes [`acp::ToolCallStatus::Failed`] so downstream
+/// consumers — notably the headless `streaming-messages-json`
+/// `web_search_tool_result_error` branch — see the real failure instead of a
+/// blanket `Completed`. Any other or absent status stays `Completed`
+/// (behavior-preserving for the success path).
+pub(super) fn backend_tool_call_status(result: Option<&serde_json::Value>) -> acp::ToolCallStatus {
+    let failed = result
+        .and_then(|r| r.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("failed");
+    if failed {
+        acp::ToolCallStatus::Failed
+    } else {
+        acp::ToolCallStatus::Completed
+    }
+}
+
+/// Expose the resolved model ID only when the backend actually routed elsewhere
+/// AND the catalog opted this model into checkpoint identity. Same
+/// `show_model_fingerprint` flag as the fingerprint itself, so one server-side
+/// setting governs both — the client keeps no per-slug default.
+pub(super) fn should_show_resolved_model(
+    requested: &str,
+    resolved: &str,
+    show_checkpoint_identity: bool,
+) -> bool {
+    show_checkpoint_identity && requested != resolved
 }
 
 /// Resolve the shell name for the system prompt `Shell:` field.
@@ -184,6 +245,9 @@ impl SessionActor {
             .send(PersistenceMsg::ContentChunk(PersistenceContentChunk::new(
                 prompt_blocks.to_vec(),
             )));
+        // Bash turns bypass `handle_prompt`'s commit point; the command is now
+        // in the ordered persistence stream, so a send-now may cancel this turn.
+        self.mark_front_message_committed().await;
 
         // Run the bash command with streaming enabled
         let tool_call_id = acp::ToolCallId::from(format!("bash-mode-{}", uuid::Uuid::new_v4()));
@@ -236,7 +300,7 @@ impl SessionActor {
             command: command.clone(),
             cwd: self.tool_context.cwd.clone(),
             env: self.tool_context.session_env.as_ref().clone(),
-            timeout: DEFAULT_TIMEOUT,
+            timeout: BASH_MODE_TIMEOUT,
             output_byte_limit: 1_048_576, // 1 MiB
             stream: true,                 // Enable streaming for bash mode
             output_file: None,            // No file logging for interactive bash mode
@@ -334,7 +398,8 @@ impl SessionActor {
 
         self.chat_state_handle.flush();
 
-        self.flush_to_disk().await;
+        let flush_error = self.flush_to_disk().await.err();
+        self.disk_full_acp_error(flush_error.as_ref())?;
 
         let total_tokens = self.chat_state_handle.get_total_tokens().await;
         ok_end_turn(total_tokens, None)
@@ -407,4 +472,50 @@ pub(super) fn build_tool_parse_error_message(
     }
 
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xai_grok_sampling_types::rs;
+
+    fn web_search_payload(status: rs::WebSearchToolCallStatus) -> serde_json::Value {
+        // The exact serialized `web_search_call` payload the sampler forwards on
+        // `BackendToolCallCompleted` (via `serde_json::to_value(ws)`).
+        serde_json::to_value(rs::WebSearchToolCall {
+            action: rs::WebSearchToolCallAction::Search(rs::WebSearchActionSearch {
+                query: "rust async runtime".to_string(),
+                sources: None,
+            }),
+            id: "ws1".to_string(),
+            status,
+        })
+        .expect("serialize web_search_call payload")
+    }
+
+    /// A backend-reported web-search failure must map to ACP `Failed` (so the
+    /// headless `web_search_tool_result_error` branch becomes reachable in
+    /// production), while a completed call — or an absent payload — stays
+    /// `Completed`. Exercises the real payload shape, not a hand-built status.
+    #[test]
+    fn backend_failed_web_search_maps_to_failed_status() {
+        let failed = web_search_payload(rs::WebSearchToolCallStatus::Failed);
+        assert_eq!(failed["status"], "failed", "wire field name is `status`");
+        assert_eq!(
+            backend_tool_call_status(Some(&failed)),
+            acp::ToolCallStatus::Failed
+        );
+
+        let completed = web_search_payload(rs::WebSearchToolCallStatus::Completed);
+        assert_eq!(
+            backend_tool_call_status(Some(&completed)),
+            acp::ToolCallStatus::Completed
+        );
+
+        // No payload at all is treated as success (behavior-preserving).
+        assert_eq!(
+            backend_tool_call_status(None),
+            acp::ToolCallStatus::Completed
+        );
+    }
 }

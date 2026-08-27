@@ -130,7 +130,10 @@ impl PermissionHookTransport for ToolServerPermissionTransport {
 }
 fn scope_for_access(access: &AccessKind) -> &'static str {
     match access {
-        AccessKind::Bash(_) | AccessKind::Edit(_) | AccessKind::MCPTool { .. } => "write",
+        AccessKind::Bash(_)
+        | AccessKind::Edit(_)
+        | AccessKind::MCPTool { .. }
+        | AccessKind::AgentMessage { .. } => "write",
         AccessKind::Read(_)
         | AccessKind::Grep { .. }
         | AccessKind::WebFetch(_)
@@ -146,20 +149,27 @@ fn describe_access(access: &AccessKind) -> String {
         AccessKind::WebSearch(query) => format!("Search the web for {query}"),
         AccessKind::Read(_) => "Read a file".to_owned(),
         AccessKind::Grep { .. } => "Search file contents".to_owned(),
+        AccessKind::AgentMessage { subagent_id } => {
+            format!("Send a message to subagent {subagent_id}")
+        }
     }
 }
 /// Build the server → chat `permission_request` payload. The field set matches
-/// chat's `PermissionRequestPayload` parser: `tool_call_id`, `tool_name`,
-/// `description`, `scope`, and the bash/edit context.
+/// chat's `PermissionRequestPayload` parser, including access-specific context.
 pub(crate) fn build_permission_payload(access: &AccessKind, tool_call_id: &str) -> Value {
-    let mut payload = serde_json::json!(
-        { "tool_call_id" : tool_call_id, "tool_name" : tool_name_for_access(access),
-        "description" : describe_access(access), "scope" : scope_for_access(access), }
-    );
+    let mut payload = serde_json::json!({
+        "tool_call_id": tool_call_id,
+        "tool_name": tool_name_for_access(access),
+        "description": describe_access(access),
+        "scope": scope_for_access(access),
+    });
     if let Some(map) = payload.as_object_mut() {
         match access {
             AccessKind::Bash(command) => {
                 map.insert("bash_command".to_owned(), Value::from(command.clone()));
+            }
+            AccessKind::AgentMessage { subagent_id } => {
+                map.insert("subagent_id".to_owned(), Value::from(subagent_id.clone()));
             }
             AccessKind::Edit(path) => {
                 map.insert(
@@ -171,6 +181,10 @@ pub(crate) fn build_permission_payload(access: &AccessKind, tool_call_id: &str) 
         }
     }
     payload
+}
+#[cfg(test)]
+pub(crate) fn build_permission_payload_for_test(access: &AccessKind, tool_call_id: &str) -> Value {
+    build_permission_payload(access, tool_call_id)
 }
 /// Decode chat's decision reply onto a [`PromptOutcome`]. The reply is chat's
 /// `permission_answer_to_json` output: `{ "outcome", "scope"?, "followup_message"? }`.
@@ -195,6 +209,7 @@ pub(crate) fn reply_to_outcome(reply: &Value) -> PromptOutcome {
         "approve" => PromptOutcome::AllowOnce,
         "always_approve" => match scope_kind_value(reply) {
             Some(("bash_command", Some(value))) => PromptOutcome::AllowAlwaysBashCommand(value),
+            Some(("bash_glob", Some(value))) => PromptOutcome::AllowAlwaysBashGlob(value),
             Some(("server_prefix", Some(value))) => PromptOutcome::AllowAlwaysMcpServer(value),
             Some(("domain", Some(value))) => PromptOutcome::AllowAlwaysDomain(value),
             _ => PromptOutcome::AllowAlways,
@@ -220,10 +235,26 @@ fn scope_kind_value(reply: &Value) -> Option<(&str, Option<String>)> {
         .map(str::to_owned);
     Some((kind, value))
 }
-/// Map a hub-served tool name + JSON args onto an [`AccessKind`] for the
-/// permission gate in [`crate::hub::SessionRoutedToolHandler`]. Returns `None`
-/// for tools that never need a user prompt (reads / todos / dynamic).
-pub fn access_kind_for_hub_tool(tool_name: &str, args: &Value) -> Option<AccessKind> {
+/// Map a hub-served semantic kind/client name + JSON args onto an [`AccessKind`]
+/// for the permission gate in [`crate::hub::SessionRoutedToolHandler`]. Semantic
+/// kind wins; the name fallback preserves legacy/kindless behavior.
+pub fn access_kind_for_hub_tool(
+    kind: Option<xai_grok_tools::types::tool::ToolKind>,
+    tool_name: &str,
+    args: &Value,
+) -> Option<AccessKind> {
+    if kind == Some(xai_grok_tools::types::tool::ToolKind::ActiveAgentMessage) {
+        return Some(AccessKind::AgentMessage {
+            subagent_id: args
+                .get("subagent_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+        });
+    }
+    access_kind_for_hub_tool_name(tool_name, args)
+}
+fn access_kind_for_hub_tool_name(tool_name: &str, args: &Value) -> Option<AccessKind> {
     let name = tool_name.rsplit(':').next().unwrap_or(tool_name);
     let name = name.strip_prefix("GrokBuild:").unwrap_or(name);
     match name {
@@ -236,9 +267,10 @@ pub fn access_kind_for_hub_tool(tool_name: &str, args: &Value) -> Option<AccessK
                 .to_owned();
             Some(AccessKind::Bash(cmd))
         }
-        "search_replace" | "hashline_edit" => {
+        "search_replace" | "hashline_edit" | "edit" => {
             let path = args
                 .get("file_path")
+                .or_else(|| args.get("filePath"))
                 .or_else(|| args.get("path"))
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
@@ -248,6 +280,7 @@ pub fn access_kind_for_hub_tool(tool_name: &str, args: &Value) -> Option<AccessK
         "write" | "write_file" => {
             let path = args
                 .get("file_path")
+                .or_else(|| args.get("filePath"))
                 .or_else(|| args.get("path"))
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
@@ -255,6 +288,22 @@ pub fn access_kind_for_hub_tool(tool_name: &str, args: &Value) -> Option<AccessK
             Some(AccessKind::Edit(path))
         }
         "apply_patch" => Some(AccessKind::Edit("apply_patch".to_owned())),
+        xai_grok_tools::implementations::grok_build::SEND_SUBAGENT_MESSAGE_TOOL_NAME => {
+            Some(AccessKind::AgentMessage {
+                subagent_id: args
+                    .get("subagent_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            })
+        }
+        "task" | "Task" | "spawn_subagent" => {
+            let kind = args
+                .get("subagent_type")
+                .and_then(Value::as_str)
+                .unwrap_or("task");
+            Some(AccessKind::Edit(format!("task:{kind}")))
+        }
         "web_fetch" => {
             let url = args
                 .get("url")
@@ -278,6 +327,7 @@ pub fn prompt_outcome_allows(outcome: &PromptOutcome) -> bool {
             | PromptOutcome::AllowAlways
             | PromptOutcome::AllowEditsForSession
             | PromptOutcome::AllowAlwaysBashCommand(_)
+            | PromptOutcome::AllowAlwaysBashGlob(_)
             | PromptOutcome::AllowAlwaysDomain(_)
             | PromptOutcome::AllowAlwaysMcpTool(_)
             | PromptOutcome::AllowAlwaysMcpServer(_)
@@ -298,10 +348,13 @@ pub async fn request_permission_via_hub(
             PromptOutcome::AllowAlways if matches!(access, AccessKind::Edit(_)) => {
                 PromptOutcome::AllowEditsForSession
             }
+            PromptOutcome::AllowAlways if matches!(access, AccessKind::AgentMessage { .. }) => {
+                PromptOutcome::AllowOnce
+            }
             other => other,
         },
         Err(e) => {
-            tracing::error!(error = % e, "hub permission request failed; rejecting");
+            tracing::error!(error = %e, "hub permission request failed; rejecting");
             PromptOutcome::Error(format!("hub permission request failed: {e}"))
         }
     }
@@ -329,6 +382,21 @@ mod tests {
         assert!(payload.get("edit_file_paths").is_none());
     }
     #[test]
+    fn payload_for_agent_message_has_dedicated_content_free_identity() {
+        let payload = build_permission_payload(
+            &AccessKind::AgentMessage {
+                subagent_id: "sub-1".into(),
+            },
+            "tc-message",
+        );
+        assert_eq!(payload["tool_name"], "send_subagent_message");
+        assert_eq!(payload["description"], "Send a message to subagent sub-1");
+        assert_eq!(payload["scope"], "write");
+        assert_eq!(payload["subagent_id"], "sub-1");
+        assert!(payload.get("edit_file_paths").is_none());
+        assert!(payload.get("bash_command").is_none());
+    }
+    #[test]
     fn payload_for_edit_carries_file_paths() {
         let payload = build_permission_payload(&AccessKind::Edit("src/main.rs".into()), "tc-2");
         assert_eq!(payload["tool_name"], "search_replace");
@@ -340,6 +408,51 @@ mod tests {
         );
         assert!(payload.get("bash_command").is_none());
         assert!(payload.get("edit_kind").is_none());
+    }
+    #[test]
+    fn hub_maps_agent_message_without_content() {
+        let args = serde_json::json!({
+            "subagent_id": "sub-1",
+            "text": "private follow-up",
+        });
+        let Some(AccessKind::AgentMessage { subagent_id }) =
+            access_kind_for_hub_tool(None, "send_subagent_message", &args)
+        else {
+            panic!("expected dedicated agent-message access")
+        };
+        assert_eq!(subagent_id, "sub-1");
+        assert!(!subagent_id.contains("private follow-up"));
+    }
+    #[test]
+    fn hub_gates_edit_and_task() {
+        assert!(matches!(
+            access_kind_for_hub_tool(
+                None,
+                "opencode:edit",
+                &serde_json::json!({
+                    "filePath": "/tmp/denied.txt",
+                    "oldString": "ORIGINAL",
+                    "newString": "BYPASS",
+                }),
+            ),
+            Some(AccessKind::Edit(p)) if p == "/tmp/denied.txt"
+        ));
+        for name in ["spawn_subagent", "Task", "task"] {
+            assert!(
+                matches!(
+                    access_kind_for_hub_tool(
+                        None,
+                        name,
+                        &serde_json::json!({
+                            "subagent_type": "general-purpose",
+                            "prompt": "edit config.toml",
+                        }),
+                    ),
+                    Some(AccessKind::Edit(p)) if p == "task:general-purpose"
+                ),
+                "hub must gate {name:?}"
+            );
+        }
     }
     #[test]
     fn payload_for_mcp_has_no_tool_context() {
@@ -359,20 +472,19 @@ mod tests {
     #[test]
     fn reply_outcomes_map_to_prompt_outcomes() {
         assert!(matches!(
-            reply_to_outcome(&serde_json::json!({ "outcome" : "approve" })),
+            reply_to_outcome(&serde_json::json!({ "outcome": "approve" })),
             PromptOutcome::AllowOnce
         ));
         assert!(matches!(
-            reply_to_outcome(&serde_json::json!({ "outcome" : "reject" })),
+            reply_to_outcome(&serde_json::json!({ "outcome": "reject" })),
             PromptOutcome::RejectOnce
         ));
         assert!(matches!(
-            reply_to_outcome(&serde_json::json!({ "outcome" : "cancelled" })),
+            reply_to_outcome(&serde_json::json!({ "outcome": "cancelled" })),
             PromptOutcome::Cancelled
         ));
         assert!(matches!(
-            reply_to_outcome(&serde_json::json!({ "outcome" : "unspecified"
-            })),
+            reply_to_outcome(&serde_json::json!({ "outcome": "unspecified" })),
             PromptOutcome::RejectOnce
         ));
         assert!(matches!(
@@ -382,9 +494,8 @@ mod tests {
     }
     #[test]
     fn reject_with_followup_routes_message_to_model() {
-        let reply = serde_json::json!(
-            { "outcome" : "reject", "followup_message" : "use cargo instead" }
-        );
+        let reply =
+            serde_json::json!({ "outcome": "reject", "followup_message": "use cargo instead" });
         match reply_to_outcome(&reply) {
             PromptOutcome::FollowupMessage(m) => assert_eq!(m, "use cargo instead"),
             other => panic!("expected FollowupMessage, got {other:?}"),
@@ -392,34 +503,33 @@ mod tests {
     }
     #[test]
     fn always_approve_maps_scope_to_persistent_outcome() {
-        let bash = serde_json::json!(
-            { "outcome" : "always_approve", "scope" : { "kind" : "bash_command", "value"
-            : "cargo build" }, }
-        );
+        let bash = serde_json::json!({
+            "outcome": "always_approve",
+            "scope": { "kind": "bash_command", "value": "cargo build" },
+        });
         match reply_to_outcome(&bash) {
             PromptOutcome::AllowAlwaysBashCommand(v) => assert_eq!(v, "cargo build"),
             other => panic!("expected AllowAlwaysBashCommand, got {other:?}"),
         }
-        let server = serde_json::json!(
-            { "outcome" : "always_approve", "scope" : { "kind" : "server_prefix", "value"
-            : "linear" }, }
-        );
+        let server = serde_json::json!({
+            "outcome": "always_approve",
+            "scope": { "kind": "server_prefix", "value": "linear" },
+        });
         match reply_to_outcome(&server) {
             PromptOutcome::AllowAlwaysMcpServer(v) => assert_eq!(v, "linear"),
             other => panic!("expected AllowAlwaysMcpServer, got {other:?}"),
         }
         assert!(matches!(
-            reply_to_outcome(&serde_json::json!({ "outcome" : "always_approve"
-            })),
+            reply_to_outcome(&serde_json::json!({ "outcome": "always_approve" })),
             PromptOutcome::AllowAlways
         ));
     }
     #[test]
     fn always_reject_with_bash_scope_persists_the_denied_prefix() {
-        let reply = serde_json::json!(
-            { "outcome" : "always_reject", "scope" : { "kind" : "bash_command", "value" :
-            "curl" }, }
-        );
+        let reply = serde_json::json!({
+            "outcome": "always_reject",
+            "scope": { "kind": "bash_command", "value": "curl" },
+        });
         match reply_to_outcome(&reply) {
             PromptOutcome::RejectAlwaysBashCommand(v) => assert_eq!(v, "curl"),
             other => panic!("expected RejectAlwaysBashCommand, got {other:?}"),
@@ -439,7 +549,7 @@ mod tests {
     #[tokio::test]
     async fn request_sends_payload_and_decodes_reply() {
         let transport = StubTransport {
-            reply: Ok(serde_json::json!({ "outcome" : "approve" })),
+            reply: Ok(serde_json::json!({ "outcome": "approve" })),
             seen: Mutex::new(None),
         };
         let outcome =
@@ -468,14 +578,27 @@ mod tests {
     #[tokio::test]
     async fn edit_always_approve_maps_to_session_scope() {
         let transport = StubTransport {
-            reply: Ok(serde_json::json!({ "outcome" : "always_approve" })),
+            reply: Ok(serde_json::json!({ "outcome": "always_approve" })),
             seen: Mutex::new(None),
         };
         let outcome =
             request_permission_via_hub(&transport, &AccessKind::Edit("a.rs".into()), "tc-9").await;
         assert!(matches!(outcome, PromptOutcome::AllowEditsForSession));
         let transport = StubTransport {
-            reply: Ok(serde_json::json!({ "outcome" : "always_approve" })),
+            reply: Ok(serde_json::json!({ "outcome": "always_approve" })),
+            seen: Mutex::new(None),
+        };
+        let outcome = request_permission_via_hub(
+            &transport,
+            &AccessKind::AgentMessage {
+                subagent_id: "sub-1".into(),
+            },
+            "tc-message",
+        )
+        .await;
+        assert!(matches!(outcome, PromptOutcome::AllowOnce));
+        let transport = StubTransport {
+            reply: Ok(serde_json::json!({ "outcome": "always_approve" })),
             seen: Mutex::new(None),
         };
         let outcome = request_permission_via_hub(

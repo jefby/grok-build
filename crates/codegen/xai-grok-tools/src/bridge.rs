@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::computer::types::KillOutcome;
+use crate::computer::types::KillSource;
 use crate::computer::types::TaskKind;
 use crate::computer::types::TerminalBackend;
 use crate::registry::types::{
@@ -141,17 +142,22 @@ impl ToolBridge {
         template: &str,
         placeholders: &serde_json::Value,
     ) -> Option<String> {
-        let registry = &*self.registry;
-        let result;
-        {
-            result = registry
-                .resources
-                .lock()
-                .await
-                .get::<TemplateRenderer>()
-                .and_then(|r| r.render_with_extra(template, placeholders).ok());
-        }
-        result
+        self.registry
+            .resources
+            .lock()
+            .await
+            .get::<TemplateRenderer>()
+            .and_then(|renderer| renderer.render_with_extra(template, placeholders).ok())
+    }
+
+    /// Return the finalized template renderer for multi-part prompt assembly.
+    pub async fn template_renderer_snapshot(&self) -> Option<TemplateRenderer> {
+        self.registry
+            .resources
+            .lock()
+            .await
+            .get::<TemplateRenderer>()
+            .cloned()
     }
 
     pub async fn register_mcp_tools<T>(
@@ -415,6 +421,16 @@ impl ToolBridge {
             .unwrap_or_default()
     }
 
+    /// Every skill name from session-start discovery
+    /// (see `SkillManager::discovery_snapshot_names`).
+    pub async fn skill_discovery_snapshot_names(&self) -> Vec<String> {
+        let registry = &*self.registry;
+        let res = registry.resources.lock().await;
+        res.get::<crate::types::skill_discovery_tracker::SkillManager>()
+            .map(|m| m.discovery_snapshot_names().to_vec())
+            .unwrap_or_default()
+    }
+
     /// Get the paths that have been reminded about.
     pub async fn agents_md_reminded_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
         let registry = &*self.registry;
@@ -468,6 +484,21 @@ impl ToolBridge {
             terminal
                 .kill_foreground_commands_by_owner(owner_session_id)
                 .await;
+        }
+    }
+
+    /// Move all running foreground commands to background instead of killing them, optionally scoped to `owner_session_id`.
+    /// Used on a mid-turn redirect (send-now) so an in-flight command is never SIGKILLed.
+    pub async fn background_foreground_commands(
+        &self,
+        owner_session_id: Option<&str>,
+    ) -> Vec<crate::computer::types::BackgroundedForeground> {
+        if let Some(terminal) = &self.terminal {
+            terminal
+                .background_foreground_commands(owner_session_id)
+                .await
+        } else {
+            Vec::new()
         }
     }
 
@@ -529,18 +560,55 @@ impl ToolBridge {
         let _ = self.registry.update_resource(resource).await;
     }
 
-    /// Kill any background task
+    /// See [`FinalizedToolset::update_resources_with`].
+    pub async fn update_resources_with(
+        &self,
+        seed: impl FnOnce(&mut crate::types::resources::Resources),
+    ) {
+        self.registry.update_resources_with(seed).await;
+    }
+
+    /// Kill a background task, recording who initiated the kill.
     pub async fn kill_background_task(
         &self,
         task_id: &str,
+        source: KillSource,
     ) -> Result<KillOutcome, xai_tool_runtime::ToolError> {
         if let Some(terminal) = &self.terminal {
-            Ok(terminal.kill_task(task_id).await)
+            Ok(terminal.kill_task_with_source(task_id, source).await)
         } else {
             Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
                 "Missing Task Id: {task_id}"
             )))
         }
+    }
+
+    /// Snapshot the session's scheduled tasks; empty when no scheduler is
+    /// registered or the actor has stopped.
+    pub async fn list_scheduled_tasks(
+        &self,
+    ) -> Vec<crate::implementations::grok_build::scheduler::types::ScheduledTask> {
+        use crate::implementations::grok_build::scheduler::types::{
+            SchedulerCommand, SchedulerHandle,
+        };
+        let sender = {
+            let res = self.registry.resources.lock().await;
+            match res.get::<SchedulerHandle>() {
+                Some(handle) => handle.0.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if sender
+            .send(SchedulerCommand::List { reply: reply_tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx
+            .await
+            .map(|snapshot| snapshot.tasks)
+            .unwrap_or_default()
     }
 
     pub async fn delete_scheduled_task(
@@ -568,9 +636,15 @@ impl ToolBridge {
             .map_err(|_| {
                 xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
             })?;
-        reply_rx.await.map_err(|_| {
-            xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor dropped reply")
-        })
+        reply_rx
+            .await
+            .map_err(|_| {
+                xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    "Scheduler actor dropped reply",
+                )
+            })?
+            .map_err(crate::implementations::grok_build::scheduler::types::scheduler_tool_error)
     }
 
     /// Move a foreground command to background by tool_call_id.
@@ -794,7 +868,11 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: owner.map(|s| s.to_string()),
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         }
     }
 
@@ -833,6 +911,78 @@ mod tests {
         assert!(
             !ids.contains(&"parent-task"),
             "another session's task must NOT leak into this session: {ids:?}"
+        );
+    }
+
+    struct RecordingKillTerminal {
+        kills: std::sync::Mutex<Vec<(String, KillSource)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TerminalBackend for RecordingKillTerminal {
+        async fn run(
+            &self,
+            _: TerminalRunRequest,
+        ) -> Result<TerminalRunResult, crate::computer::types::ComputerError> {
+            unimplemented!()
+        }
+        async fn run_background(
+            &self,
+            _: TerminalRunRequest,
+        ) -> Result<BackgroundHandle, crate::computer::types::ComputerError> {
+            unimplemented!()
+        }
+        async fn kill_task(&self, task_id: &str) -> KillOutcome {
+            self.kill_task_with_source(task_id, KillSource::ModelTool)
+                .await
+        }
+        async fn kill_task_with_source(&self, task_id: &str, source: KillSource) -> KillOutcome {
+            self.kills
+                .lock()
+                .unwrap()
+                .push((task_id.to_string(), source));
+            KillOutcome::Killed
+        }
+        async fn get_task(&self, _: &str) -> Option<TaskSnapshot> {
+            None
+        }
+        async fn wait_for_completion(&self, _: &str, _: Option<Duration>) -> Option<TaskSnapshot> {
+            None
+        }
+        async fn list_tasks(&self) -> Vec<TaskSnapshot> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_background_task_forwards_source() {
+        let backend = Arc::new(RecordingKillTerminal {
+            kills: std::sync::Mutex::new(Vec::new()),
+        });
+        let bridge = ToolBridge {
+            registry: Arc::new(FinalizedToolset::empty_for_test()),
+            terminal: Some(backend.clone()),
+        };
+        assert_eq!(
+            bridge
+                .kill_background_task("t-ui", KillSource::ClientUi)
+                .await
+                .unwrap(),
+            KillOutcome::Killed
+        );
+        assert_eq!(
+            bridge
+                .kill_background_task("t-td", KillSource::Teardown)
+                .await
+                .unwrap(),
+            KillOutcome::Killed
+        );
+        assert_eq!(
+            *backend.kills.lock().unwrap(),
+            vec![
+                ("t-ui".into(), KillSource::ClientUi),
+                ("t-td".into(), KillSource::Teardown),
+            ]
         );
     }
 

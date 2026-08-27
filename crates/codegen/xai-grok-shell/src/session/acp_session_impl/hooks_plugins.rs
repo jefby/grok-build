@@ -82,6 +82,22 @@ impl SessionActor {
         }
     }
 
+    /// Whether `name` resolves to a managed-policy (non-disableable) hook in
+    /// the live registry, keyed on the spec's typed `layer` — never on the name.
+    /// Fails open on a missing registry/name by design: a disable entry that
+    /// slips through is inert, because the dispatcher re-checks provenance at
+    /// run time — this modal check is UX, not the enforcement boundary.
+    pub(super) fn is_managed_policy_hook(&self, name: &str) -> bool {
+        self.hook_registry
+            .borrow()
+            .as_ref()
+            .is_some_and(|registry| {
+                registry
+                    .find_by_name(name)
+                    .is_some_and(|spec| spec.is_managed_policy())
+            })
+    }
+
     // ── Hooks/plugins action handlers (pager modal) ──────────────────
 
     /// Handle a hooks management action from the pager modal.
@@ -206,6 +222,16 @@ impl SessionActor {
                 }
             }
             HooksAction::Disable { hook_name } => {
+                if self.is_managed_policy_hook(&hook_name) {
+                    return ActionOutcome {
+                        status: OutcomeStatus::ValidationError,
+                        message: format!(
+                            "Hook '{hook_name}' is enforced by managed policy and cannot be disabled."
+                        ),
+                        requires_reload: false,
+                        requires_restart: false,
+                    };
+                }
                 match xai_grok_hooks::trust::disable_hook(&hook_name) {
                     Ok(()) => ActionOutcome {
                         status: OutcomeStatus::Success,
@@ -248,20 +274,34 @@ impl SessionActor {
                 disable,
             } => {
                 let mut toggled = 0usize;
+                let mut managed_skipped = 0usize;
                 for name in &hook_names {
+                    // Managed-policy hooks are exempt from bulk disable, same
+                    // rule as the per-hook Disable action.
+                    if disable && self.is_managed_policy_hook(name) {
+                        managed_skipped += 1;
+                        continue;
+                    }
                     let ok = if disable {
                         xai_grok_hooks::trust::disable_hook(name).is_ok()
                     } else {
-                        xai_grok_hooks::trust::enable_hook(name).is_ok()
+                        // Only an actual removal counts (Ok(false) = wasn't disabled).
+                        xai_grok_hooks::trust::enable_hook(name) == Ok(true)
                     };
                     if ok {
                         toggled += 1;
                     }
                 }
                 let action = if disable { "Disabled" } else { "Enabled" };
+                let mut message = format!("{action} {toggled}/{} hooks", hook_names.len());
+                if managed_skipped > 0 {
+                    message.push_str(&format!(
+                        " ({managed_skipped} enforced by managed policy, not disabled)"
+                    ));
+                }
                 ActionOutcome {
                     status: OutcomeStatus::Success,
-                    message: format!("{action} {toggled}/{} hooks", hook_names.len()),
+                    message,
                     requires_reload: false,
                     requires_restart: false,
                 }
@@ -694,14 +734,15 @@ impl SessionActor {
         // Extract all RefCell borrows into locals before the .await so
         // no Ref guard is alive across the suspension point.
         {
-            use crate::extensions::hooks::hook_spec_to_info;
+            use crate::extensions::hooks::hook_spec_to_info_with;
             let hooks = {
+                let disabled = xai_grok_hooks::trust::DisabledHooks::load();
                 let reg = self.hook_registry.borrow();
                 match &*reg {
                     Some(registry) => registry
                         .all_hooks()
                         .iter()
-                        .map(|s| hook_spec_to_info(s))
+                        .map(|s| hook_spec_to_info_with(s, &disabled))
                         .collect(),
                     None => Vec::new(),
                 }
@@ -887,8 +928,18 @@ impl SessionActor {
                     hook_reg.remove_by_prefix("plugin/");
                     hook_reg.append_specs(new_specs);
                 } else if !new_specs.is_empty() {
-                    let (mut new_reg, _) =
-                        xai_grok_hooks::discovery::load_hooks_from_sources(&[], &[]);
+                    // No registry yet: bootstrap config-layer and file hooks (as
+                    // reload_hooks_impl does), not empty sources, so a plugin-first
+                    // snapshot doesn't drop config hooks.
+                    let git_root =
+                        xai_grok_workspace::session::git::find_git_root_from_path(session_cwd).ok();
+                    let is_trusted =
+                        crate::agent::folder_trust::resolve_and_record(session_cwd, None, false);
+                    let (mut new_reg, _errs) = crate::util::hooks::discover_hooks(
+                        git_root.as_deref(),
+                        &self.rebuild_spec.compat,
+                        is_trusted,
+                    );
                     new_reg.append_specs(new_specs);
                     *reg = Some(Arc::new(new_reg));
                 }
@@ -913,17 +964,9 @@ impl SessionActor {
         // the order-sensitive `update_configs` would cause (merge order is
         // non-deterministic). Mirrors the `UpdateMcpServers` command handler.
         let t_mcp = std::time::Instant::now();
-        let managed_configs = {
-            let mcp_handle = self.managed_mcp_handle.lock().await;
-            match &mcp_handle.cache {
-                crate::session::managed_mcp::ManagedMcpCache::Ready(configs) => configs.clone(),
-                _ => vec![],
-            }
-        };
         let new_mcp_servers = crate::session::managed_mcp::merge_managed_mcp_servers(
             self.initial_client_mcp_servers.clone(),
             session_cwd,
-            &managed_configs,
             new_registry_snapshot.as_deref(),
             &self.rebuild_spec.compat,
         );
@@ -993,15 +1036,16 @@ impl SessionActor {
         // Notification hooks that also borrow these RefCells).
         let t_notify = std::time::Instant::now();
         {
-            use crate::extensions::hooks::hook_spec_to_info;
+            use crate::extensions::hooks::hook_spec_to_info_with;
 
             let hooks = {
+                let disabled = xai_grok_hooks::trust::DisabledHooks::load();
                 let reg = self.hook_registry.borrow();
                 match &*reg {
                     Some(registry) => registry
                         .all_hooks()
                         .iter()
-                        .map(|s| hook_spec_to_info(s))
+                        .map(|s| hook_spec_to_info_with(s, &disabled))
                         .collect(),
                     None => Vec::new(),
                 }

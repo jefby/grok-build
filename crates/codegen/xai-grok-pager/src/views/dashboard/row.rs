@@ -158,6 +158,99 @@ pub fn build_rows_with_roster(
     sort_rows(&mut rows, grouping, reorder);
     rows
 }
+/// Build dashboard v2 rows from the persisted workspace membership.
+///
+/// The snapshot is authoritative: live agents absent from it are intentionally
+/// omitted until the adoption PR writes them into the store. A matching live
+/// agent contributes its richer runtime row; otherwise stored metadata produces
+/// a read-only idle row.
+pub fn build_rows_with_workspace(
+    agents: &IndexMap<AgentId, AgentView>,
+    snapshot: &xai_grok_dashboard_store::WorkspaceSnapshot,
+    home: Option<&str>,
+) -> Vec<DashboardRow> {
+    let live_by_session: std::collections::HashMap<&str, (AgentId, &AgentView)> = agents
+        .iter()
+        .filter_map(|(id, agent)| {
+            agent
+                .session
+                .session_id
+                .as_ref()
+                .map(|session_id| (session_id.0.as_ref(), (*id, agent)))
+        })
+        .collect();
+    snapshot
+        .members
+        .iter()
+        .filter(|member| matches!(member.kind, xai_grok_dashboard_store::MemberKind::Build))
+        .map(|member| {
+            if let Some((id, agent)) = live_by_session.get(member.session_id.as_ref()) {
+                return top_level_row(*id, agent, false, false, home);
+            }
+            workspace_member_row(member, home)
+        })
+        .collect()
+}
+fn workspace_member_row(
+    member: &xai_grok_dashboard_store::Member,
+    home: Option<&str>,
+) -> DashboardRow {
+    let session_id = member.session_id.as_ref();
+    let cwd = member
+        .cwd
+        .as_deref()
+        .filter(|cwd| !cwd.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let label = member
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(sanitize)
+        .or_else(|| {
+            cwd.file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .map(sanitize)
+        })
+        .unwrap_or_else(|| sanitize(session_id));
+    let mut badges = Vec::new();
+    if member.is_worktree {
+        badges.push(RowBadge::Worktree);
+    }
+    DashboardRow {
+        id: DashboardRowId::Workspace {
+            session_id: session_id.to_owned(),
+        },
+        label,
+        subtitle: None,
+        state: RowState::Idle,
+        activity: None,
+        secondary_line: member
+            .last_turn_summary
+            .as_deref()
+            .or(member.model.as_deref())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(sanitize),
+        cwd_display: if cwd.as_os_str().is_empty() {
+            String::new()
+        } else {
+            super::state::compact_cwd(&cwd, home)
+        },
+        cwd,
+        last_change_at: crate::util::system_time_from_unix_ms(member.last_change_unix_ms),
+        pinned: false,
+        is_active: false,
+        badges,
+        context_pct: None,
+        indent: 0,
+        parent_label: None,
+        is_more_placeholder: false,
+        more_count: 0,
+    }
+}
 /// Build the local-agent rows WITHOUT applying filter or sort. Shared by
 /// [`build_rows`] and [`build_rows_with_roster`].
 ///
@@ -196,7 +289,11 @@ fn build_local_rows(
         if !include_subagents {
             continue;
         }
-        let mut subagents: Vec<&SubagentInfo> = agent.subagent_sessions.values().collect();
+        let mut subagents: Vec<&SubagentInfo> = agent
+            .subagent_sessions
+            .values()
+            .filter(|info| info.workflow_run_id.is_none())
+            .collect();
         subagents.sort_by(|a, b| {
             let a_running = !a.finished;
             let b_running = !b.finished;
@@ -249,7 +346,9 @@ fn build_local_rows(
     rows
 }
 /// Map a leader [`RosterActivity`] to the dashboard's coarse [`RowState`].
-fn roster_activity_to_state(activity: RosterActivity) -> RowState {
+/// Public so the dispatcher can gate roster-row deletion through the very
+/// same `RowState::allows_delete` predicate the renderer paints `[✗]` with.
+pub fn roster_activity_to_state(activity: RosterActivity) -> RowState {
     match activity {
         RosterActivity::Working => RowState::Working,
         RosterActivity::NeedsInput => RowState::NeedsInput,
@@ -331,8 +430,9 @@ fn append_roster_rows(
             state,
             activity,
             secondary_line: entry
-                .model_id
+                .last_turn_summary
                 .as_deref()
+                .or(entry.model_id.as_deref())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(sanitize),
@@ -371,6 +471,7 @@ pub fn classify_top_level(agent: &AgentView) -> RowState {
         return RowState::NeedsInput;
     }
     if !agent.session.state.is_idle()
+        || agent.wake_turn_active()
         || agent.session.turn_activity().is_some()
         || !agent.session.pending_prompts.is_empty()
     {
@@ -400,47 +501,22 @@ pub fn has_background_work(agent: &AgentView) -> bool {
         .any(|t| t.status == crate::app::agent::BgTaskStatus::Running)
         || !agent.session.scheduled_tasks.is_empty()
 }
-/// Compact `"watching · …"` label summarising a turn-idle agent's live
-/// background work, listing only the non-zero kinds with singular/plural
-/// nouns — e.g. `"watching · 1 monitor · 2 loops"` or
-/// `"watching · 1 task"`. `None` when there's no background work (the
-/// caller then falls back to a bare `"Working"`). Mirrors the agent
-/// view's idle "watching" cue (`turn_status::watching_label`) so the
-/// dashboard and the agent view speak the same language; the counting
-/// matches [`has_background_work`].
+/// Compact `"… still running"` label summarising a turn-idle agent's live
+/// background work — e.g. `"1 monitor · 2 loops still running"` or
+/// `"1 task still running"`. `None` when there's no background work (the
+/// caller then falls back to a bare `"Working"`). Shares the format
+/// mechanics with the agent view's idle cue
+/// ([`crate::views::turn_status::format_still_running`]) but keeps the
+/// dashboard's own nouns ("task", not "command") and omits subagents —
+/// dashboard rows list those separately. Counts come from local state (not
+/// backend content), so no sanitise.
 fn background_work_label(agent: &AgentView) -> Option<String> {
-    use std::fmt::Write as _;
-    let mut monitors = 0usize;
-    let mut tasks = 0usize;
-    for t in agent.session.bg_tasks.values() {
-        if t.status != crate::app::agent::BgTaskStatus::Running {
-            continue;
-        }
-        if t.is_monitor {
-            monitors += 1;
-        } else {
-            tasks += 1;
-        }
-    }
-    let loops = agent.session.scheduled_tasks.len();
-    if monitors + tasks + loops == 0 {
-        return None;
-    }
-    let mut label = String::with_capacity(24);
-    label.push_str("watching");
-    if monitors > 0 {
-        let noun = if monitors == 1 { "monitor" } else { "monitors" };
-        let _ = write!(label, " \u{00b7} {monitors} {noun}");
-    }
-    if loops > 0 {
-        let noun = if loops == 1 { "loop" } else { "loops" };
-        let _ = write!(label, " \u{00b7} {loops} {noun}");
-    }
-    if tasks > 0 {
-        let noun = if tasks == 1 { "task" } else { "tasks" };
-        let _ = write!(label, " \u{00b7} {tasks} {noun}");
-    }
-    Some(label)
+    let w = agent.watchers();
+    crate::views::turn_status::format_still_running([
+        (w.monitors, "monitor"),
+        (w.loops, "loop"),
+        (w.commands, "task"),
+    ])
 }
 /// Classify a subagent.
 ///
@@ -534,19 +610,7 @@ fn top_level_row(
     let subtitle = top_level_subtitle(agent);
     let activity = top_level_activity(agent, state);
     let secondary_line = top_level_secondary_line(agent, state, activity.as_deref());
-    let anchor: Instant = match state {
-        RowState::Working => agent
-            .turn_started_at
-            .or(agent.last_active_at)
-            .unwrap_or_else(fallback_epoch),
-        RowState::NeedsInput
-        | RowState::Idle
-        | RowState::Inactive
-        | RowState::Completed
-        | RowState::Failed
-        | RowState::Blocked => agent.last_active_at.unwrap_or_else(fallback_epoch),
-    };
-    let last_change_at = crate::util::system_time_from_instant(anchor);
+    let last_change_at = top_level_last_change_at(agent, state);
     let mut badges = Vec::new();
     if agent.is_worktree {
         badges.push(RowBadge::Worktree);
@@ -585,6 +649,22 @@ fn top_level_row(
         is_more_placeholder: false,
         more_count: 0,
     }
+}
+/// Wall-clock anchor used by both dashboard rows and workspace metadata sync.
+pub(crate) fn top_level_last_change_at(agent: &AgentView, state: RowState) -> SystemTime {
+    let anchor: Instant = match state {
+        RowState::Working => agent
+            .turn_started_at
+            .or(agent.last_active_at)
+            .unwrap_or_else(fallback_epoch),
+        RowState::NeedsInput
+        | RowState::Idle
+        | RowState::Inactive
+        | RowState::Completed
+        | RowState::Failed
+        | RowState::Blocked => agent.last_active_at.unwrap_or_else(fallback_epoch),
+    };
+    crate::util::system_time_from_instant(anchor)
 }
 fn subagent_row(
     parent: AgentId,
@@ -756,7 +836,11 @@ fn top_level_secondary_line(
         | RowState::Inactive
         | RowState::Completed
         | RowState::Failed
-        | RowState::Blocked => last_agent_message_preview(agent),
+        | RowState::Blocked => agent
+            .last_turn_summary
+            .as_deref()
+            .map(sanitize)
+            .or_else(|| last_agent_message_preview(agent)),
     }
 }
 /// Walk the scrollback from the end, returning the first
@@ -1069,8 +1153,100 @@ fn build_clusters(rows: &[DashboardRow]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol as acp;
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
+    fn workspace_member(
+        session_id: &str,
+        title: &str,
+        summary: Option<&str>,
+    ) -> xai_grok_dashboard_store::Member {
+        xai_grok_dashboard_store::Member {
+            session_id: xai_grok_dashboard_store::SessionId::new(session_id).unwrap(),
+            kind: xai_grok_dashboard_store::MemberKind::Build,
+            origin: xai_grok_dashboard_store::MemberOrigin::Local,
+            cwd: Some(format!("/tmp/{session_id}")),
+            title: Some(title.to_owned()),
+            model: Some("grok-test".to_owned()),
+            last_turn_summary: summary.map(str::to_owned),
+            is_worktree: false,
+            last_change_unix_ms: 1_725_000_000_000,
+            pin_rank: None,
+            order_rank: None,
+        }
+    }
+    fn workspace_snapshot(
+        members: Vec<xai_grok_dashboard_store::Member>,
+    ) -> xai_grok_dashboard_store::WorkspaceSnapshot {
+        xai_grok_dashboard_store::WorkspaceSnapshot {
+            grouping: xai_grok_dashboard_store::Grouping::State,
+            members,
+            data_version: 1,
+        }
+    }
+    #[test]
+    fn workspace_snapshot_is_authoritative_and_live_match_enriches_row() {
+        let mut matched = crate::app::agent_view::test_fixtures::make_agent();
+        matched.session.session_id = Some(acp::SessionId::new("saved"));
+        matched.display_name = Some("Live title".to_owned());
+        let mut unadopted = crate::app::agent_view::test_fixtures::make_agent();
+        unadopted.session.session_id = Some(acp::SessionId::new("not-saved"));
+        let agents = IndexMap::from([(AgentId(7), matched), (AgentId(8), unadopted)]);
+        let snapshot = workspace_snapshot(vec![workspace_member(
+            "saved",
+            "Stored title",
+            Some("Stored summary"),
+        )]);
+        let rows = build_rows_with_workspace(&agents, &snapshot, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, DashboardRowId::TopLevel(AgentId(7)));
+        assert_eq!(rows[0].label, "Live title");
+    }
+    #[test]
+    fn workspace_rows_ignore_non_build_members() {
+        let mut conversation = workspace_member("shared", "Conversation", None);
+        conversation.kind = xai_grok_dashboard_store::MemberKind::Conversation;
+        let snapshot = workspace_snapshot(vec![
+            workspace_member("shared", "Build", None),
+            conversation,
+        ]);
+        let rows = build_rows_with_workspace(&IndexMap::new(), &snapshot, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].id,
+            DashboardRowId::Workspace {
+                session_id: "shared".to_owned()
+            }
+        );
+        assert_eq!(rows[0].label, "Build");
+    }
+    #[test]
+    fn unloaded_workspace_members_are_idle_in_snapshot_order() {
+        let mut second = workspace_member("second", "Second", None);
+        second.is_worktree = true;
+        let snapshot = workspace_snapshot(vec![
+            workspace_member("first", "First", Some("First summary")),
+            second,
+        ]);
+        let rows = build_rows_with_workspace(&IndexMap::new(), &snapshot, None);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].id,
+            DashboardRowId::Workspace {
+                session_id: "first".to_owned()
+            }
+        );
+        assert_eq!(rows[0].state, RowState::Idle);
+        assert_eq!(rows[0].secondary_line.as_deref(), Some("First summary"));
+        assert_eq!(
+            rows[1].id,
+            DashboardRowId::Workspace {
+                session_id: "second".to_owned()
+            }
+        );
+        assert_eq!(rows[1].secondary_line.as_deref(), Some("grok-test"));
+        assert!(rows[1].badges.contains(&RowBadge::Worktree));
+    }
     fn make_subagent(child_id: &str, finished: bool, status: Option<&str>) -> SubagentInfo {
         let now = Instant::now();
         SubagentInfo {
@@ -1084,8 +1260,9 @@ mod tests {
             context_source: None,
             resumed_from: None,
             capability_mode: None,
+            workflow_run_id: None,
             context_normalized: false,
-            child_updates_replayed: false,
+            transcript: Default::default(),
             parent_prompt_id: None,
             started_at: now,
             last_progress_at: now,
@@ -1116,6 +1293,30 @@ mod tests {
     fn classify_subagent_running() {
         let info = make_subagent("a", false, None);
         assert_eq!(classify_subagent(&info), RowState::Working);
+    }
+    #[test]
+    fn full_tree_excludes_workflow_owned_subagent_rows() {
+        let mut agents = IndexMap::new();
+        let mut agent = crate::app::agent_view::test_fixtures::make_agent();
+        let mut workflow_child = make_subagent("workflow-child", false, None);
+        workflow_child.workflow_run_id = Some(Arc::from("wf_1"));
+        agent
+            .subagent_sessions
+            .insert("workflow-child".into(), workflow_child);
+        agents.insert(AgentId(0), agent);
+        let rows = build_rows(
+            &agents,
+            &Default::default(),
+            &[],
+            Some(AgentId(0)),
+            super::super::state::Grouping::State,
+            &Filter::default(),
+            None,
+        );
+        assert!(
+            rows.iter()
+                .all(|row| !matches!(row.id, DashboardRowId::Subagent { .. }))
+        );
     }
     #[test]
     fn classify_subagent_completed() {
@@ -1383,7 +1584,7 @@ mod tests {
         let older = newer - Duration::from_secs(60);
         let mut rows = vec![
             DashboardRow {
-                last_change_at: newer,
+                last_change_at: newer, // recency would put id1 first
                 ..make_row_with_id(id1.clone(), 0, RowState::Working)
             },
             DashboardRow {
@@ -1501,6 +1702,7 @@ mod tests {
             model_id: None,
             yolo: false,
             activity: RosterActivity::Dormant,
+            last_turn_summary: None,
             resident: false,
             last_change_unix_ms,
             origin: RosterOrigin::default(),
@@ -1672,6 +1874,22 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].secondary_line.as_deref(), Some("grok-4.5"));
     }
+    /// The last-turn summary wins the secondary line over the model id.
+    #[test]
+    fn append_roster_rows_prefers_last_turn_summary() {
+        let empty = std::collections::BTreeSet::new();
+        let entry = RosterEntry {
+            model_id: Some("grok-4.5".to_string()),
+            last_turn_summary: Some("Fixed the roster merge".to_string()),
+            ..roster_entry_with("m", Some("Fix the bug"), RosterActivity::Dormant)
+        };
+        let rows = collect_roster(&[entry], &empty);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].secondary_line.as_deref(),
+            Some("Fixed the roster merge")
+        );
+    }
     /// Without a model id there's genuinely nothing to show, so the
     /// second line stays empty rather than rendering a placeholder.
     #[test]
@@ -1727,12 +1945,15 @@ mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),
             bg_tool_call_to_task: std::collections::HashMap::new(),
             scheduled_tasks: std::collections::HashMap::new(),
             in_flight_prompt: None,
+            compact_held_prompt: None,
             current_prompt_id: None,
             created_via_new: false,
         };
@@ -1885,6 +2106,7 @@ mod tests {
             created_at: std::time::Instant::now(),
             next_fire_at: None,
             tag: "loop".into(),
+            last_subagent_id: None,
         }
     }
     /// A turn-idle agent with a RUNNING background task is `Working`, not
@@ -1920,7 +2142,7 @@ mod tests {
             .insert("m1".into(), running_bg_task("m1", true));
         assert_eq!(classify_top_level(&agent), RowState::Working);
         let row = top_level_row(AgentId(0), &agent, false, false, None);
-        assert_eq!(row.activity.as_deref(), Some("watching · 1 monitor"));
+        assert_eq!(row.activity.as_deref(), Some("1 monitor still running"));
     }
     /// An active scheduled `/loop` keeps the agent `Working` even with a
     /// fully idle turn, labelled as a loop.
@@ -1933,7 +2155,7 @@ mod tests {
             .insert("l1".into(), scheduled_loop("l1"));
         assert_eq!(classify_top_level(&agent), RowState::Working);
         let row = top_level_row(AgentId(0), &agent, false, false, None);
-        assert_eq!(row.activity.as_deref(), Some("watching · 1 loop"));
+        assert_eq!(row.activity.as_deref(), Some("1 loop still running"));
     }
     /// The background-work label lists every non-zero kind (monitors,
     /// then loops, then plain tasks) with correct singular/plural nouns.
@@ -1960,12 +2182,12 @@ mod tests {
         let row = top_level_row(AgentId(0), &agent, false, false, None);
         assert_eq!(
             row.activity.as_deref(),
-            Some("watching · 1 monitor · 1 loop · 2 tasks"),
+            Some("1 monitor · 1 loop · 2 tasks still running"),
         );
     }
     /// The background-work label is the LAST activity fallback: a more
     /// specific Working signal (here, replay loading) still wins over
-    /// "watching · …", so a real turn is never masked by it.
+    /// "… still running", so a real turn is never masked by it.
     #[test]
     fn specific_working_activity_wins_over_background_label() {
         let mut agent = make_idle_agent_with_model(None);

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
-use xai_grok_workspace::foreign_sessions::{
+use xai_grok_foreign_sessions::{
     EnabledForeignSessionSources, ForeignSessionSummary, ForeignSessionTool, RecentForeignSession,
 };
 
@@ -447,6 +447,9 @@ pub(crate) fn map_summary(summary: ForeignSessionSummary) -> SessionPickerEntry 
         branch: summary.branch,
         repo_name: crate::views::session_picker::repo_name_from_cwd(&cwd),
         worktree_label: None,
+        last_turn_summary: None,
+        last_recap: None,
+        session_kind: None,
         card_detail: None,
     }
 }
@@ -518,7 +521,7 @@ mod tests {
     use std::cell::RefCell;
     use std::time::{Duration, UNIX_EPOCH};
 
-    use xai_grok_workspace::foreign_sessions::ForeignSessionSource;
+    use xai_grok_foreign_sessions::ForeignSessionSource;
 
     use super::*;
 
@@ -556,6 +559,9 @@ mod tests {
             branch: None,
             repo_name: "repo".into(),
             worktree_label: None,
+            last_turn_summary: None,
+            last_recap: None,
+            session_kind: None,
             card_detail: None,
         }
     }

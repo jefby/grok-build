@@ -125,7 +125,7 @@ impl PlanModeTracker {
     /// it is collapsed: `Pending` → `Inactive`, `ExitPending` → `Inactive`
     /// (with exit reminder set), since those states depend on in-flight
     /// client/turn interactions that don't survive a restart.
-    pub fn from_snapshot(session_dir: PathBuf, mut snapshot: PlanModeSnapshot) -> Self {
+    pub(crate) fn from_snapshot(session_dir: PathBuf, mut snapshot: PlanModeSnapshot) -> Self {
         match snapshot.state {
             PlanModeState::Pending => {
                 snapshot.state = PlanModeState::Inactive;
@@ -147,11 +147,11 @@ impl PlanModeTracker {
         }
     }
     /// Mark that the client is waiting on plan approval (`exit_plan_mode` parked).
-    pub fn set_awaiting_plan_approval(&mut self, awaiting: bool) {
+    pub(crate) fn set_awaiting_plan_approval(&mut self, awaiting: bool) {
         self.awaiting_plan_approval = awaiting;
     }
     /// Whether approval is outstanding (also true after resume from snapshot).
-    pub fn is_awaiting_plan_approval(&self) -> bool {
+    pub(crate) fn is_awaiting_plan_approval(&self) -> bool {
         self.awaiting_plan_approval
     }
     /// Capture the current lifecycle state as a persistable snapshot.
@@ -172,6 +172,19 @@ impl PlanModeTracker {
     pub fn is_active(&self) -> bool {
         self.state == PlanModeState::Active
     }
+    /// The prompt mode the session is in according to this tracker.
+    ///
+    /// The prompt-mode mirrors follow the tracker, never the other way round,
+    /// and a restored tracker is the only thing that knows a resumed session is
+    /// still planning. Seeding a mirror `Agent` under a restored `Active` makes
+    /// the first prompt resolve `Agent` and reconcile the plan mode away.
+    pub(crate) fn session_prompt_mode(&self) -> PromptMode {
+        if self.is_active() {
+            PromptMode::Plan
+        } else {
+            PromptMode::Agent
+        }
+    }
     /// Returns the absolute path to the plan file.
     pub fn plan_file_path(&self) -> &Path {
         &self.plan_file_path
@@ -179,20 +192,20 @@ impl PlanModeTracker {
     /// Returns `true` if plan mode is active and the given edit path
     /// targets the plan file. Used to bypass the permission prompt for
     /// plan file edits during plan mode.
-    pub fn should_auto_approve_edit(&self, edit_path: &Path) -> bool {
+    pub(crate) fn should_auto_approve_edit(&self, edit_path: &Path) -> bool {
         self.is_active() && is_plan_file_write(edit_path, &self.plan_file_path)
     }
     /// Whether the next reminder should be the full variant.
     /// Even count = full, odd count = sparse.
-    pub fn should_use_full_reminder(&self) -> bool {
+    pub(crate) fn should_use_full_reminder(&self) -> bool {
         self.reminder_count.is_multiple_of(2)
     }
     /// Whether we need to inject an exit reminder on the next turn.
-    pub fn has_pending_exit_reminder(&self) -> bool {
+    pub(crate) fn has_pending_exit_reminder(&self) -> bool {
         self.pending_exit_reminder
     }
     /// Whether this is a reentry (was previously in plan mode this session).
-    pub fn is_reentry(&self) -> bool {
+    pub(crate) fn is_reentry(&self) -> bool {
         self.was_previously_active && self.state == PlanModeState::Pending
     }
     /// Client toggled plan mode ON.
@@ -200,7 +213,7 @@ impl PlanModeTracker {
     /// Returns true if state actually changed. Handles re-entry from
     /// `ExitPending` by cancelling the deferred exit and returning
     /// directly to `Active` (the model already has plan mode context).
-    pub fn enter_pending(&mut self) -> bool {
+    pub(crate) fn enter_pending(&mut self) -> bool {
         match self.state {
             PlanModeState::Inactive => {
                 self.state = PlanModeState::Pending;
@@ -234,7 +247,7 @@ impl PlanModeTracker {
     /// The reminder is recorded (alternation counter) at delivery
     /// ([`Self::take_pending_activation`]), not here, so a withdrawn or
     /// restart-lost buffer doesn't advance the full/sparse cycle.
-    pub fn activate_mid_turn(&mut self, rendered_reminder: String) -> bool {
+    pub(crate) fn activate_mid_turn(&mut self, rendered_reminder: String) -> bool {
         if self.state != PlanModeState::Pending {
             return false;
         }
@@ -251,7 +264,7 @@ impl PlanModeTracker {
     /// Take the buffered mid-turn activation reminder for delivery.
     /// The caller pushes it into the conversation and then calls
     /// [`Self::record_reminder_injected`].
-    pub fn take_pending_activation(&mut self) -> Option<String> {
+    pub(crate) fn take_pending_activation(&mut self) -> Option<String> {
         self.pending_activation.take().map(|p| p.text)
     }
     /// Whether a mid-turn activation reminder is buffered (undelivered).
@@ -260,7 +273,7 @@ impl PlanModeTracker {
     }
     /// Agent called EnterPlanMode tool \u{2014} go directly to Active.
     /// Returns true if state actually changed.
-    pub fn activate_from_tool(&mut self) -> bool {
+    pub(crate) fn activate_from_tool(&mut self) -> bool {
         if self.state != PlanModeState::Inactive {
             return false;
         }
@@ -278,7 +291,7 @@ impl PlanModeTracker {
     /// the exit, or by explicitly arming [`Self::queue_exit_reminder`] when the
     /// result text carries no such signal. A reminder armed here would only
     /// drain at the next turn start, arriving a turn late and stale.
-    pub fn deactivate_approved(&mut self) -> bool {
+    pub(crate) fn deactivate_approved(&mut self) -> bool {
         if self.state != PlanModeState::Active {
             return false;
         }
@@ -290,7 +303,7 @@ impl PlanModeTracker {
     }
     /// Client toggled plan mode OFF.
     /// `turn_in_flight`: whether a model turn is currently running.
-    pub fn user_exit(&mut self, turn_in_flight: bool) {
+    pub(crate) fn user_exit(&mut self, turn_in_flight: bool) {
         self.awaiting_plan_approval = false;
         if let Some(pending) = self.pending_activation.take()
             && self.state == PlanModeState::Active
@@ -315,7 +328,7 @@ impl PlanModeTracker {
         }
     }
     /// Current turn completed while in ExitPending.
-    pub fn complete_deferred_exit(&mut self) {
+    pub(crate) fn complete_deferred_exit(&mut self) {
         if self.state != PlanModeState::ExitPending {
             return;
         }
@@ -327,20 +340,20 @@ impl PlanModeTracker {
     /// For exit paths whose tool result carries no exit signal (the compat
     /// harness — policy and rationale live on the bridge's
     /// `queue_exit_reminder_on_approved_exit` flag).
-    pub fn queue_exit_reminder(&mut self) {
+    pub(crate) fn queue_exit_reminder(&mut self) {
         self.pending_exit_reminder = true;
     }
     /// Called after injecting a per-turn reminder. Advances the counter.
-    pub fn record_reminder_injected(&mut self) {
+    pub(crate) fn record_reminder_injected(&mut self) {
         self.reminder_count += 1;
     }
     /// Called after injecting the exit reminder. Clears the flag.
-    pub fn clear_pending_exit_reminder(&mut self) {
+    pub(crate) fn clear_pending_exit_reminder(&mut self) {
         self.pending_exit_reminder = false;
     }
     /// Called after compaction. Resets reminder counter so next
     /// injection is the full variant.
-    pub fn reset_after_compaction(&mut self) {
+    pub(crate) fn reset_after_compaction(&mut self) {
         if self.state == PlanModeState::Active {
             self.reminder_count = 0;
             self.pending_activation = None;
@@ -359,7 +372,7 @@ impl PlanModeTracker {
 ///
 /// Tool name placeholders (`${{ tools.by_kind.edit }}`, etc.) are resolved
 /// automatically from the registry's `ToolKind` \u{2192} client-facing name mapping.
-pub fn plan_mode_reminder_full_template() -> &'static str {
+pub(crate) fn plan_mode_reminder_full_template() -> &'static str {
     "\
 Plan mode is active. Do not make any edits or writes to the system.
 
@@ -383,7 +396,7 @@ requirements or ${{ tools.by_kind.exit_plan }} to present your plan to the user.
 /// Static string for alternating turns (when `reminder_count` is odd) to save
 /// tokens. No MiniJinja placeholders — plan path and tool names are only in the
 /// full reminder.
-pub fn plan_mode_reminder_sparse_template() -> &'static str {
+pub(crate) fn plan_mode_reminder_sparse_template() -> &'static str {
     "Plan mode is still active. Do not make any edits or writes to the system except for the plan file."
 }
 /// Reentry reminder template.
@@ -391,7 +404,7 @@ pub fn plan_mode_reminder_sparse_template() -> &'static str {
 /// Returns a MiniJinja template string injected when entering plan mode for
 /// the second+ time in the same session. Render via
 /// `TemplateRenderer::render_with_extra()` with `{ "plan_path": "..." }`.
-pub fn plan_mode_reentry_reminder_template() -> &'static str {
+pub(crate) fn plan_mode_reentry_reminder_template() -> &'static str {
     "\
 ## Returning to Plan Mode
 
@@ -406,14 +419,14 @@ Your turn should only end with either ${{ tools.by_kind.ask_user }} to clarify r
 ///
 /// Render via `TemplateRenderer::render_with_extra()` with
 /// `{ "plan_path": "..." }`.
-pub fn plan_mode_edit_rejected_template() -> &'static str {
+pub(crate) fn plan_mode_edit_rejected_template() -> &'static str {
     "Rejected: file edits are not allowed in plan mode - the only editable file is the plan file (${{ plan_path }})."
 }
 /// Exit reminder template.
 ///
 /// Returns a MiniJinja template string injected once after exiting plan mode
 /// (user-initiated exit via toggle). Contains no placeholders.
-pub fn plan_mode_exit_reminder_template() -> &'static str {
+pub(crate) fn plan_mode_exit_reminder_template() -> &'static str {
     "\
 You have exited plan mode. You can now make edits, run tools, and take actions."
 }
@@ -421,7 +434,7 @@ You have exited plan mode. You can now make edits, run tools, and take actions."
 ///
 /// `target_path` is the absolute path the tool is trying to write to.
 /// `plan_file` is the absolute path from [`PlanModeTracker::plan_file_path`].
-pub fn is_plan_file_write(target_path: &Path, plan_file: &Path) -> bool {
+pub(crate) fn is_plan_file_write(target_path: &Path, plan_file: &Path) -> bool {
     target_path == plan_file
 }
 /// Whether the path's final component ends with a markdown suffix (case-insensitive).
@@ -431,7 +444,7 @@ pub fn is_plan_file_write(target_path: &Path, plan_file: &Path) -> bool {
 ///
 /// In plan mode the shell rejects `Write` and `StrReplace` when this is
 /// false while plan mode is active (see `prepare_tool_call` in `acp_session.rs`).
-pub fn is_markdown_file_path(path: &Path) -> bool {
+pub(crate) fn is_markdown_file_path(path: &Path) -> bool {
     const MARKDOWN_SUFFIXES: &[&str] = &[".md", ".markdown", ".mdown", ".mkd", ".mkdn", ".mdx"];
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -477,7 +490,7 @@ pub enum PromptMode {
 }
 impl PromptMode {
     /// Parse from the `_meta.mode` string. Unknown values default to `Agent`.
-    pub fn from_meta_str(s: &str) -> Self {
+    pub(crate) fn from_meta_str(s: &str) -> Self {
         match s {
             "ask" => Self::Ask,
             "plan" => Self::Plan,
@@ -657,20 +670,6 @@ mod tests {
         .into();
         TemplateRenderer::new(tools, HashMap::new())
     }
-    /// Build a test TemplateRenderer that includes the Task tool.
-    fn test_renderer_with_task() -> TemplateRenderer {
-        let tools: HashMap<ToolKind, String> = [
-            (ToolKind::Edit, "search_replace".to_owned()),
-            (ToolKind::Read, "read_file".to_owned()),
-            (ToolKind::List, "list_dir".to_owned()),
-            (ToolKind::Search, "grep".to_owned()),
-            (ToolKind::AskUser, "ask_user_question".to_owned()),
-            (ToolKind::ExitPlan, "exit_plan_mode".to_owned()),
-            (ToolKind::Task, "task".to_owned()),
-        ]
-        .into();
-        TemplateRenderer::new(tools, HashMap::new())
-    }
     /// Build a TemplateRenderer with custom (non-default) tool names.
     fn custom_renderer() -> TemplateRenderer {
         let tools: HashMap<ToolKind, String> = [
@@ -690,49 +689,44 @@ mod tests {
         plan_path: &str,
         plan_has_content: bool,
     ) -> String {
-        let extra = serde_json::json!(
-            { "plan_path" : plan_path, "plan_has_content" : plan_has_content, }
-        );
+        let extra = serde_json::json!({
+            "plan_path": plan_path,
+            "plan_has_content": plan_has_content,
+        });
         renderer.render_with_extra(template, &extra).unwrap()
     }
     #[test]
-    fn full_reminder_with_existing_plan() {
+    fn full_reminder_interpolates_plan_path_and_edit_tool() {
         let r = test_renderer();
-        let text = render(
+        let with_plan = render(
             &r,
             plan_mode_reminder_full_template(),
             "/tmp/session/plan.md",
             true,
         );
-        assert!(text.contains("A plan file exists at /tmp/session/plan.md"));
-        assert!(text.contains("search_replace tool"));
-        assert!(text.contains("Plan mode is active"));
-        assert!(text.contains("## Plan File:"));
-        assert!(text.contains("only file you are allowed to edit"));
-        assert!(!text.contains("No plan written yet"));
-    }
-    #[test]
-    fn full_reminder_without_plan() {
-        let r = test_renderer();
-        let text = render(
+        let without_plan = render(
             &r,
             plan_mode_reminder_full_template(),
             "/tmp/session/plan.md",
             false,
         );
-        assert!(text.contains("No plan written yet"));
-        assert!(text.contains("/tmp/session/plan.md"));
-        assert!(text.contains("search_replace tool"));
-        assert!(text.contains("Plan mode is active"));
-        assert!(!text.contains("A plan file exists at"));
+        assert_ne!(
+            with_plan, without_plan,
+            "plan_has_content must change the compiled reminder"
+        );
+        for text in [&with_plan, &without_plan] {
+            assert!(text.contains("/tmp/session/plan.md"));
+            assert!(text.contains("search_replace"));
+            assert!(!text.contains("${{"));
+        }
     }
     #[test]
     fn full_reminder_resolves_all_tool_names() {
         let r = test_renderer();
         let text = render(&r, plan_mode_reminder_full_template(), "/tmp/plan.md", true);
-        assert!(text.contains("search_replace tool"));
-        assert!(text.contains("ask_user_question to clarify requirements"));
-        assert!(text.contains("exit_plan_mode to present your plan to the user"));
+        assert!(text.contains("search_replace"));
+        assert!(text.contains("ask_user_question"));
+        assert!(text.contains("exit_plan_mode"));
         assert!(
             !text.contains("${{"),
             "unresolved template placeholder found"
@@ -742,46 +736,21 @@ mod tests {
     fn full_reminder_with_custom_tool_names() {
         let r = custom_renderer();
         let text = render(&r, plan_mode_reminder_full_template(), "/tmp/plan.md", true);
-        assert!(text.contains("EditFile tool"));
-        assert!(text.contains("AskUser to clarify requirements"));
-        assert!(text.contains("FinishPlan to present your plan to the user"));
+        assert!(text.contains("EditFile"));
+        assert!(text.contains("AskUser"));
+        assert!(text.contains("FinishPlan"));
         assert!(!text.contains("search_replace"));
         assert!(!text.contains("ask_user_question"));
         assert!(!text.contains("exit_plan_mode"));
     }
     #[test]
-    fn full_reminder_has_no_subagent_guidance() {
-        let r = test_renderer_with_task();
-        let text = render(&r, plan_mode_reminder_full_template(), "/tmp/plan.md", true);
-        assert!(
-            !text.contains("subagent_type"),
-            "full reminder should not include subagent guidance: {text}"
-        );
-        let r = test_renderer();
-        let text = render(&r, plan_mode_reminder_full_template(), "/tmp/plan.md", true);
-        assert!(!text.contains("subagent_type"));
-    }
-    #[test]
-    fn full_reminder_has_no_phase_workflow() {
-        let r = test_renderer();
-        let text = render(&r, plan_mode_reminder_full_template(), "/tmp/plan.md", true);
-        assert!(!text.contains("Phase 1:"));
-        assert!(!text.contains("Plan Workflow"));
-        assert!(!text.contains("Iterative Planning Workflow"));
-        assert!(!text.contains("The Loop"));
-    }
-    #[test]
-    fn sparse_reminder_is_static_read_only_nudge() {
+    fn sparse_reminder_does_not_interpolate() {
         let r = test_renderer();
         let text = render(
             &r,
             plan_mode_reminder_sparse_template(),
             "/tmp/plan.md",
             false,
-        );
-        assert_eq!(
-            text,
-            "Plan mode is still active. Do not make any edits or writes to the system except for the plan file."
         );
         assert!(!text.contains("/tmp/plan.md"));
         assert!(!text.contains("exit_plan_mode"));
@@ -798,7 +767,7 @@ mod tests {
         );
         assert!(!text.contains("AskUser"));
         assert!(!text.contains("FinishPlan"));
-        assert!(text.contains("Plan mode is still active"));
+        assert!(!text.contains("${{"));
     }
     #[test]
     fn reentry_reminder_renders() {
@@ -809,9 +778,7 @@ mod tests {
             "/tmp/plan.md",
             false,
         );
-        assert!(text.contains("Returning to Plan Mode"));
         assert!(text.contains("/tmp/plan.md"));
-        assert!(text.contains("entering plan mode again"));
         assert!(text.contains("exit_plan_mode"));
         assert!(text.contains("ask_user_question"));
         assert!(!text.contains("${{"));
@@ -825,8 +792,8 @@ mod tests {
             "/tmp/plan.md",
             false,
         );
-        assert!(text.contains("FinishPlan to present your plan to the user"));
-        assert!(text.contains("AskUser to clarify requirements"));
+        assert!(text.contains("FinishPlan"));
+        assert!(text.contains("AskUser"));
         assert!(!text.contains("exit_plan_mode"));
         assert!(!text.contains("ask_user_question"));
     }
@@ -839,12 +806,7 @@ mod tests {
             "/tmp/plan.md",
             false,
         );
-        assert_eq!(
-            text,
-            "You have exited plan mode. You can now make edits, run tools, and take actions."
-        );
         assert!(!text.contains("/tmp/plan.md"));
-        assert!(!text.contains("/implement"));
         assert!(!text.contains("${{"));
     }
     #[test]
@@ -856,10 +818,8 @@ mod tests {
             "/tmp/session/plan.md",
             false,
         );
-        assert_eq!(
-            text,
-            "Rejected: file edits are not allowed in plan mode - the only editable file is the plan file (/tmp/session/plan.md)."
-        );
+        assert!(text.contains("/tmp/session/plan.md"));
+        assert!(!text.contains("${{"));
     }
     #[test]
     fn templates_are_static_with_no_hardcoded_tool_names() {
@@ -1060,6 +1020,23 @@ mod tests {
         let restored = PlanModeTracker::from_snapshot(PathBuf::from("/tmp/test-session"), snap);
         assert_eq!(restored.state(), PlanModeState::Active);
         assert!(!restored.should_use_full_reminder());
+    }
+    /// A resumed session that was planning still reports `Plan`. The mirrors
+    /// are seeded from this at spawn: seeding `Agent` instead makes the first
+    /// prompt resolve `Agent`, reconcile, and drop the plan mode silently.
+    #[test]
+    fn session_prompt_mode_follows_a_restored_active_tracker() {
+        let mut t = test_tracker();
+        t.enter_pending();
+        t.activate();
+        let restored = PlanModeTracker::from_snapshot(PathBuf::from("/tmp/test"), t.snapshot());
+        assert_eq!(restored.state(), PlanModeState::Active);
+        assert_eq!(restored.session_prompt_mode(), PromptMode::Plan);
+        assert_eq!(
+            test_tracker().session_prompt_mode(),
+            PromptMode::Agent,
+            "an inactive tracker is agent mode"
+        );
     }
     #[test]
     fn snapshot_pending_collapses_to_inactive() {

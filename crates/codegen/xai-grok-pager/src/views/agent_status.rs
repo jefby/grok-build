@@ -9,7 +9,7 @@
 //! ```ignore
 //! let mut status = AgentStatusBar::new(&theme);
 //! status.push("context", context_line);
-//! status.push("badge", badge_line);
+//! status.push("queue", queue_line);
 //! let areas = status.render(buf, status_bar_rect);
 //! let context_area = areas.get("context");
 //! ```
@@ -26,10 +26,11 @@ use super::turn_status::SPINNER_DIVISOR;
 use crate::app::agent::{GoalDisplayPhase, GoalDisplayState, GoalDisplayStatus};
 use crate::app::agent_view::McpInitProgress;
 use crate::theme::Theme;
+use crate::views::tasks_pane::TaskStatusCounts;
 
 /// A named status bar item.
 struct StatusEntry {
-    /// Identifier for hit-test lookup (e.g., "context", "badge").
+    /// Identifier for hit-test lookup (e.g., "context", "queue").
     id: &'static str,
     /// Pre-built styled content.
     line: Line<'static>,
@@ -134,6 +135,49 @@ impl<'a> AgentStatusBar<'a> {
     }
 }
 
+pub(crate) fn task_status_line(
+    counts: TaskStatusCounts,
+    theme: &Theme,
+    is_hovered: bool,
+) -> Option<Line<'static>> {
+    if counts == TaskStatusCounts::default() {
+        return None;
+    }
+
+    let hover = if is_hovered {
+        ratatui::style::Modifier::BOLD
+    } else {
+        ratatui::style::Modifier::empty()
+    };
+    let running_style = Style::default()
+        .fg(theme.accent_running)
+        .bg(theme.bg_base)
+        .add_modifier(hover);
+    let paused_style = Style::default()
+        .fg(theme.warning)
+        .bg(theme.bg_base)
+        .add_modifier(hover);
+    let mut spans = Vec::with_capacity(2);
+
+    if counts.running > 0 {
+        // Static, and the same diamond the task rows use. The header sits in view the whole session,
+        // so a spinner here reads as noise rather than progress.
+        spans.push(Span::styled(
+            format!("{} {}", crate::glyphs::diamond_filled(), counts.running),
+            running_style,
+        ));
+    }
+    if counts.paused_workflows > 0 {
+        let prefix = if counts.running > 0 { "  " } else { "" };
+        spans.push(Span::styled(
+            format!("{prefix}P {}", counts.paused_workflows),
+            paused_style,
+        ));
+    }
+
+    Some(Line::from(spans))
+}
+
 // ---------------------------------------------------------------------------
 // Goal status line
 // ---------------------------------------------------------------------------
@@ -175,6 +219,8 @@ fn goal_phase_label(goal: &GoalDisplayState) -> String {
         | GoalDisplayStatus::NoProgressPaused
         | GoalDisplayStatus::InfraPaused
         | GoalDisplayStatus::Blocked => goal.status.pause_label().into(),
+        GoalDisplayStatus::Failed => "Failed".into(),
+        GoalDisplayStatus::Interrupted => "Interrupted".into(),
         GoalDisplayStatus::BudgetLimited => "Budget".into(),
         GoalDisplayStatus::Complete => "Done".into(),
         GoalDisplayStatus::Active => active_phase_label(goal),
@@ -211,7 +257,7 @@ pub fn active_phase_label(goal: &GoalDisplayState) -> String {
 /// Returns the empty string when both fields are absent / zero — no
 /// classifier run has been reserved yet, so there is no meaningful
 /// counter. Callers render it only when non-empty: the chip drops the
-/// `(n/m)` suffix, the modal falls back to an em-dash.
+/// `(n/m)` suffix, the modal falls back to a hyphen.
 pub fn classifier_attempts_label(goal: &GoalDisplayState) -> String {
     let attempt = goal.classifier_runs_attempted.unwrap_or(0);
     let max = goal.classifier_max_runs.unwrap_or(0);
@@ -254,6 +300,11 @@ pub fn goal_status_line(
     // visually matches the modal's `theme.warning` status row.
     let mut label_style = if goal.status.is_paused() {
         Style::default().fg(theme.bg_base).bg(theme.warning)
+    } else if matches!(
+        goal.status,
+        GoalDisplayStatus::Failed | GoalDisplayStatus::Interrupted
+    ) {
+        Style::default().fg(theme.bg_base).bg(theme.accent_error)
     } else {
         Style::default().fg(theme.accent_plan).bg(theme.bg_base)
     };
@@ -266,12 +317,13 @@ pub fn goal_status_line(
 
     let is_active = matches!(goal.status, GoalDisplayStatus::Active);
 
+    let chip_name = "Goal";
     let goal_text = if is_active {
         let frames = crate::glyphs::dot_spinner_frames();
         let frame = frames[(tick / 4) % frames.len()];
-        format!("{frame} Goal: {label}")
+        format!("{frame} {chip_name}: {label}")
     } else {
-        format!("Goal: {label}")
+        format!("{chip_name}: {label}")
     };
 
     Line::from(vec![
@@ -316,6 +368,10 @@ pub fn mcp_status_line(
         ),
     ]))
 }
+
+#[cfg(test)]
+#[path = "agent_status_task_tests.rs"]
+mod task_tests;
 
 #[cfg(test)]
 mod tests {
@@ -686,6 +742,18 @@ mod tests {
             .expect("label span with `Goal:` prefix");
         assert_eq!(label_span.style.bg, Some(t.bg_base));
         assert_ne!(label_span.style.bg, Some(t.warning));
+    }
+
+    #[test]
+    fn phase_label_failed() {
+        let g = make_goal(
+            GoalDisplayStatus::Failed,
+            GoalDisplayPhase::Idle,
+            None,
+            0,
+            0,
+        );
+        assert_eq!(goal_phase_label(&g), "Failed");
     }
 
     #[test]

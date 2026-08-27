@@ -59,6 +59,10 @@ reqwest = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing = { workspace = true }
 
+[[test]]
+name = "env_op_compile"
+path = "tests/env_op_compile.rs"
+
 [[bin]]
 name = "pty-scenario"
 path = "src/bin/pty_scenario.rs"
@@ -69,6 +73,10 @@ path = "src/bin/pty_scenario.rs"
 [[bin]]
 name = "scroll-matrix"
 path = "src/bin/scroll_matrix.rs"
+
+[[bin]]
+name = "startup-tui-probe"
+path = "src/bin/startup_tui_probe.rs"
 
 # pty_bench scenario runner — produces a standalone binary the CI pipeline
 # pre-compiles and executes directly against a release pager artifact.

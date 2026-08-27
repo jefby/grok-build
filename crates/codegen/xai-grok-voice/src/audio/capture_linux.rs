@@ -17,29 +17,35 @@
 //! pipeline and probe are backend-agnostic.
 
 use std::io::Read;
-use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc as async_mpsc;
 
+use super::pipe::{self, READ_CHUNK};
 use crate::error::VoiceError;
 
-/// PCM read size from the recorder's stdout (bytes) — ~64 ms at 16 kHz mono
-/// PCM16. Small enough to stream responsively, large enough to avoid syscall
-/// churn on the reader thread.
-const READ_CHUNK: usize = 2048;
-
-/// How long to wait after spawning before deciding the recorder started cleanly.
-/// A missing device or a stopped audio server makes the recorder exit within a
-/// few ms; this surfaces that as an error instead of a session that "listens"
-/// but never produces audio (mirrors the `cpal` backend's open handshake).
+/// Grace before a start is accepted: a missing device, dead audio server, or
+/// rejected flag exits within a few ms, so waiting surfaces that as an error
+/// (and triggers fallback) instead of a silent "listening" session that never
+/// produces audio (mirrors the `cpal` backend's open handshake).
 const START_GRACE: Duration = Duration::from_millis(300);
 
+/// Poll interval while waiting out [`START_GRACE`]: a rejected flag dies in a
+/// few ms, so a failing recorder falls through to the next without paying the
+/// full grace.
+const START_POLL: Duration = Duration::from_millis(15);
+
+/// Upper bound on the `pw-record --help` capability probe so a wedged binary
+/// can't hang `/voice` or Doctor. A misjudged probe only reorders candidates
+/// (see [`candidate_recorders`]) and never blocks, so this can be generous.
+const PW_HELP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A system audio recorder that can stream raw PCM16 mono to stdout.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Recorder {
     /// PipeWire's `pw-record`.
     PwRecord,
@@ -65,6 +71,15 @@ impl Recorder {
         let rate = rate.to_string();
         match self {
             Recorder::PwRecord => vec![
+                // `--raw` is load-bearing: without it `pw-record` treats
+                // `--format`/`--rate`/`--channels` as a libsndfile container
+                // subformat and wraps stdout in a container — WAV on
+                // PipeWire < 1.6 (unwritable to a pipe: "this file format
+                // does not support pipe writing", exit 1 — e.g. Ubuntu 24.04
+                // / Debian 12 ship 1.0/1.2), AU with a header on ≥ 1.6. Raw
+                // mode fwrites pure PCM16 frames, which is what the reader
+                // expects from every backend.
+                "--raw".into(),
                 "--rate".into(),
                 rate,
                 "--channels".into(),
@@ -95,19 +110,36 @@ impl Recorder {
     }
 }
 
-/// First recorder found on `PATH`, preferring PipeWire > PulseAudio > ALSA so we
-/// go through the user's configured audio server (and its default input device)
-/// rather than grabbing a raw ALSA `hw:` device.
-fn detect_recorder() -> Option<Recorder> {
-    detect_recorder_with(binary_on_path)
-}
+/// Executable recorders on `PATH` in preference order (PipeWire > PulseAudio >
+/// ALSA), to route through the user's audio server not a raw ALSA `hw:` device.
+///
+/// A `pw-record` that the `--raw` probe rejects (PipeWire < ~1.0, e.g. Ubuntu
+/// 22.04's 0.3.48, which can't stream PCM to a pipe) is *demoted* below
+/// `parec`/`arecord` rather than dropped — it stays as a last resort so a
+/// misjudged or wedged probe (a false negative) can never hard-block an
+/// otherwise-working `pw-record`. The spawn in [`spawn_working_recorder`] is the
+/// source of truth; the probe only decides ordering.
+fn candidate_recorders(
+    available: impl Fn(&str) -> bool,
+    pw_record_supports_raw: impl Fn() -> bool,
+) -> Vec<Recorder> {
+    let pw_available = available("pw-record");
+    let pw_leads = pw_available && pw_record_supports_raw();
 
-/// [`detect_recorder`] with the `PATH` probe injected, so the preference order
-/// is unit-testable without process-global `PATH` mutation.
-fn detect_recorder_with(available: impl Fn(&str) -> bool) -> Option<Recorder> {
-    [Recorder::PwRecord, Recorder::Parec, Recorder::Arecord]
-        .into_iter()
-        .find(|r| available(r.program()))
+    let mut recorders = Vec::with_capacity(3);
+    if pw_leads {
+        recorders.push(Recorder::PwRecord);
+    }
+    if available("parec") {
+        recorders.push(Recorder::Parec);
+    }
+    if available("arecord") {
+        recorders.push(Recorder::Arecord);
+    }
+    if pw_available && !pw_leads {
+        recorders.push(Recorder::PwRecord);
+    }
+    recorders
 }
 
 /// Whether `name` resolves to an executable regular file on any `PATH` entry
@@ -125,35 +157,129 @@ fn binary_on_path(name: &str) -> bool {
     })
 }
 
-/// Spawn the chosen recorder with stdout/stderr piped, and confirm it didn't
-/// exit immediately (no device, audio server down). On success the child is
-/// running with `stdout` available for reading.
-fn spawn_recorder(sample_rate: u32) -> Result<(Recorder, Child), VoiceError> {
-    let recorder = detect_recorder().ok_or_else(|| {
-        VoiceError::Config(
+/// Whether `pw-record` accepts `--raw` (PipeWire >= ~1.0), via `pw-record
+/// --help` (opens no capture device). Scans stdout and stderr since usage text
+/// lands on either; a probe that can't run — or outlives [`PW_HELP_TIMEOUT`] —
+/// counts as "no `--raw`", which only demotes `pw-record` (never blocks it, see
+/// [`candidate_recorders`]).
+fn pw_record_supports_raw() -> bool {
+    let mut cmd = Command::new("pw-record");
+    cmd.arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    xai_tty_utils::detach_std_command(&mut cmd);
+    #[allow(clippy::disallowed_methods)] // short-lived probe, bounded + reaped below
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+
+    // Bound the probe so a wedged `pw-record --help` can't hang `/voice` or
+    // Doctor. `--help` prints a few lines then exits, well under the pipe
+    // buffer, so reading after it exits can't deadlock; a child that outlives
+    // the window is killed and treated as "no --raw".
+    let deadline = Instant::now() + PW_HELP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => thread::sleep(START_POLL),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+
+    let mut help = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_end(&mut help);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_end(&mut help);
+    }
+    String::from_utf8_lossy(&help).contains("--raw")
+}
+
+/// [`candidate_recorders`], or a `VoiceError` naming what to install when `PATH`
+/// has none.
+fn require_recorders(
+    available: impl Fn(&str) -> bool,
+    pw_record_supports_raw: impl Fn() -> bool,
+) -> Result<Vec<Recorder>, VoiceError> {
+    let recorders = candidate_recorders(&available, &pw_record_supports_raw);
+    if recorders.is_empty() {
+        return Err(VoiceError::Config(
             "no microphone recorder found on PATH: install pipewire (pw-record), \
              pulseaudio-utils (parec), or alsa-utils (arecord)"
                 .into(),
-        )
-    })?;
+        ));
+    }
+    Ok(recorders)
+}
 
-    let mut child = Command::new(recorder.program())
-        .args(recorder.args(sample_rate))
+/// First recorder that spawns and survives [`START_GRACE`]; the walk also covers
+/// a `pw-record` the `--raw` probe misjudged, and failures are joined for the
+/// `/voice` toast.
+fn spawn_working_recorder(sample_rate: u32) -> Result<(Recorder, Child), VoiceError> {
+    let recorders = require_recorders(binary_on_path, pw_record_supports_raw)?;
+    first_success(&recorders, |recorder| {
+        try_spawn(recorder, sample_rate).inspect_err(|failure| {
+            tracing::debug!(recorder = recorder.program(), %failure, "recorder failed to start");
+        })
+    })
+    .map_err(|failures| {
+        VoiceError::Config(format!("could not start a microphone recorder: {failures}"))
+    })
+}
+
+/// First candidate `try_one` accepts, else all failures joined. Separate from
+/// spawning so the fallback order is unit-testable without real recorders.
+fn first_success<T>(
+    candidates: &[Recorder],
+    mut try_one: impl FnMut(Recorder) -> Result<T, String>,
+) -> Result<(Recorder, T), String> {
+    let mut failures = Vec::new();
+    for &recorder in candidates {
+        match try_one(recorder) {
+            Ok(value) => return Ok((recorder, value)),
+            Err(failure) => failures.push(failure),
+        }
+    }
+    Err(failures.join("; "))
+}
+
+/// Spawn one recorder and confirm it survives [`START_GRACE`]; on early exit the
+/// error carries the child's stderr (e.g. `unrecognized option '--raw'`) for the
+/// toast and fallback.
+fn try_spawn(recorder: Recorder, sample_rate: u32) -> Result<Child, String> {
+    let mut cmd = Command::new(recorder.program());
+    cmd.args(recorder.args(sample_rate))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // setsid detach via the sanctioned helper (workspace subprocess rule): the
+    // recorder writes to a pipe and must not share the pager's controlling TTY.
+    xai_tty_utils::detach_std_command(&mut cmd);
+    #[allow(clippy::disallowed_methods)] // recorder owned by the capture handle, killed on stop
+    let mut child = cmd
         .spawn()
-        .map_err(|e| VoiceError::Config(format!("failed to start {}: {e}", recorder.program())))?;
+        .map_err(|e| format!("failed to start {}: {e}", recorder.program()))?;
 
-    thread::sleep(START_GRACE);
-    match child.try_wait() {
-        Ok(Some(status)) => {
+    match wait_through_grace(&mut child) {
+        // `try_wait` in `wait_through_grace` already reaped the child.
+        Ok(StartOutcome::ExitedEarly(status)) => {
             let mut stderr = String::new();
             if let Some(mut err) = child.stderr.take() {
                 let _ = err.read_to_string(&mut stderr);
             }
             let stderr = stderr.trim();
-            Err(VoiceError::Config(format!(
+            Err(format!(
                 "{} exited immediately ({status}){}",
                 recorder.program(),
                 if stderr.is_empty() {
@@ -161,84 +287,63 @@ fn spawn_recorder(sample_rate: u32) -> Result<(Recorder, Child), VoiceError> {
                 } else {
                     format!(": {stderr}")
                 },
-            )))
+            ))
         }
-        Ok(None) => Ok((recorder, child)),
-        Err(e) => Err(VoiceError::Config(format!(
-            "failed to poll {}: {e}",
-            recorder.program()
-        ))),
+        Ok(StartOutcome::StillRunning) => Ok(child),
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!("failed to poll {}: {e}", recorder.program()))
+        }
+    }
+}
+
+/// Whether a just-spawned recorder is still running after [`START_GRACE`].
+enum StartOutcome {
+    /// Exited within the grace window — a failed start (rejected flag, no
+    /// device, dead audio server).
+    ExitedEarly(std::process::ExitStatus),
+    /// Still alive at the deadline — started cleanly.
+    StillRunning,
+}
+
+fn wait_through_grace(child: &mut Child) -> std::io::Result<StartOutcome> {
+    let deadline = Instant::now() + START_GRACE;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(StartOutcome::ExitedEarly(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(StartOutcome::StillRunning);
+        }
+        thread::sleep(START_POLL);
     }
 }
 
 /// Stop handle for the recorder subprocess (owns the child + reader thread).
-pub struct CaptureHandle {
-    /// `Some` until `stop()` or `Drop` consumes it (kill + reap).
-    child: Option<Child>,
-    stop: Arc<AtomicBool>,
-    reader: Option<JoinHandle<()>>,
-}
-
-impl CaptureHandle {
-    /// Stop capture: kill the recorder, reap it, and join the reader thread so
-    /// the input device is released before returning.
-    ///
-    /// Dropping a `CaptureHandle` also kills and reaps the recorder (see
-    /// `Drop`), but without joining the reader; call `stop()` when you must be
-    /// sure the device is freed before continuing.
-    pub fn stop(mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
-    }
-}
-
-impl Drop for CaptureHandle {
-    fn drop(&mut self) {
-        // Always kill the recorder so the mic is released even when `stop()` was
-        // never called — e.g. the STT session ended on its own (server close /
-        // error). Killing closes the child's stdout, so the reader thread's
-        // blocking `read` returns 0 and it exits. `Drop` must never block (it
-        // may run on an async executor), so the reap happens on a detached
-        // thread — without it every drop-path teardown (session supersede, STT
-        // error, connect failure) would leave a zombie until the pager exits.
-        self.stop.store(true, Ordering::Release);
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            // `Builder::spawn` (not `thread::spawn`) so spawn failure under
-            // thread exhaustion degrades to kill-without-reap instead of a
-            // panic — a panicking `Drop` during unwind would abort.
-            let _ = thread::Builder::new()
-                .name("voice-capture-reap".into())
-                .spawn(move || {
-                    let _ = child.wait();
-                });
-        }
-    }
-}
+pub use super::pipe::ChildCaptureHandle as CaptureHandle;
 
 /// Spawn subprocess capture; PCM16 LE chunks are forwarded to `pcm_tx`.
 pub fn spawn_pcm_capture(
     sample_rate: u32,
     pcm_tx: async_mpsc::Sender<Vec<u8>>,
 ) -> Result<CaptureHandle, VoiceError> {
-    let (recorder, mut child) = spawn_recorder(sample_rate)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| VoiceError::Config(format!("{} produced no stdout", recorder.program())))?;
+    let (recorder, mut child) = spawn_working_recorder(sample_rate)?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(VoiceError::Config(format!(
+            "{} produced no stdout",
+            recorder.program()
+        )));
+    };
 
-    drain_stderr(&mut child, recorder.program());
+    pipe::drain_stderr(&mut child, recorder.program());
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_reader = Arc::clone(&stop);
     let device = recorder.program();
-    let reader = thread::spawn(move || forward_pcm(stdout, pcm_tx, stop_reader, device));
+    let reader = thread::spawn(move || pipe::forward_pcm(stdout, pcm_tx, stop_reader, device));
 
     tracing::info!(
         recorder = recorder.program(),
@@ -246,77 +351,24 @@ pub fn spawn_pcm_capture(
         "voice capture stream (subprocess)"
     );
 
-    Ok(CaptureHandle {
-        child: Some(child),
-        stop,
-        reader: Some(reader),
+    Ok(CaptureHandle::new(child, stop, reader))
+}
+
+/// Recorder capture would try first, without recording ([`crate::probe::input_device_info`]).
+/// Capability-aware ordering means a too-old `pw-record` is reported behind
+/// `parec`/`arecord` when those exist, so Doctor is accurate on the common
+/// Ubuntu 22.04 setup instead of a false green on `pw-record`.
+pub fn input_device_info() -> Result<crate::probe::InputDeviceInfo, VoiceError> {
+    let recorders = require_recorders(binary_on_path, pw_record_supports_raw)?;
+    // `require_recorders` returns a non-empty list on `Ok`; degrade to an error
+    // rather than panic if that ever changes.
+    let recorder = *recorders
+        .first()
+        .ok_or_else(|| VoiceError::Config("no microphone recorder found on PATH".into()))?;
+    Ok(crate::probe::InputDeviceInfo {
+        name: recorder.program().to_string(),
+        detail: "system recorder; uses the audio server's default input".to_string(),
     })
-}
-
-/// Drain the recorder's stderr to EOF on a detached thread so a chatty recorder
-/// (xrun/underrun warnings, etc.) can't fill the pipe buffer and block its own
-/// writes — which would stall capture, since the hot path never reads stderr.
-/// Non-empty output is logged at debug for diagnostics. The thread ends on its
-/// own when the child exits (EOF), so it is not joined.
-fn drain_stderr(child: &mut Child, device: &'static str) {
-    let Some(mut stderr) = child.stderr.take() else {
-        return;
-    };
-    thread::spawn(move || {
-        let mut buf = String::new();
-        if stderr.read_to_string(&mut buf).is_ok() {
-            let msg = buf.trim();
-            if !msg.is_empty() {
-                tracing::debug!(device, stderr = msg, "voice recorder stderr");
-            }
-        }
-    });
-}
-
-/// Forward raw PCM from the recorder's stdout to the async STT sender until the
-/// recorder stops (EOF on kill), the consumer goes away, or `stop` is set.
-fn forward_pcm(
-    mut stdout: ChildStdout,
-    pcm_tx: async_mpsc::Sender<Vec<u8>>,
-    stop: Arc<AtomicBool>,
-    device: &'static str,
-) {
-    let mut buf = vec![0u8; READ_CHUNK];
-    let mut dropped = 0u64;
-    loop {
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-        match stdout.read(&mut buf) {
-            // EOF: the recorder closed stdout (killed by teardown or exited).
-            Ok(0) => break,
-            Ok(n) => {
-                // Never park this thread on the channel: `stop()` joins it, so a
-                // send that waits on a stalled STT consumer would turn teardown
-                // into a hang. Shed load instead when the consumer is behind —
-                // the same strategy as the cpal backend's real-time callback.
-                // (`read` itself is unblocked by the kill-on-stop path: killing
-                // the recorder closes stdout, so a waiting `read` returns 0.)
-                match pcm_tx.try_send(buf[..n].to_vec()) {
-                    Ok(()) => {}
-                    Err(async_mpsc::error::TrySendError::Full(_)) => dropped += 1,
-                    // Consumer is gone: the session ended; stop capturing.
-                    Err(async_mpsc::error::TrySendError::Closed(_)) => break,
-                }
-            }
-            Err(e) => {
-                tracing::warn!(device, error = %e, "voice capture read error");
-                break;
-            }
-        }
-    }
-    if dropped > 0 {
-        tracing::warn!(
-            device,
-            dropped,
-            "voice capture dropped PCM chunks (slow consumer)"
-        );
-    }
 }
 
 /// Record mono PCM16 LE for a fixed duration (probe / diagnostics).
@@ -324,12 +376,16 @@ pub fn capture_pcm_for_duration(
     sample_rate: u32,
     seconds: u32,
 ) -> Result<(Vec<u8>, u32), VoiceError> {
-    let (recorder, mut child) = spawn_recorder(sample_rate)?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| VoiceError::Config(format!("{} produced no stdout", recorder.program())))?;
-    drain_stderr(&mut child, recorder.program());
+    let (recorder, mut child) = spawn_working_recorder(sample_rate)?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(VoiceError::Config(format!(
+            "{} produced no stdout",
+            recorder.program()
+        )));
+    };
+    pipe::drain_stderr(&mut child, recorder.program());
 
     let duration = Duration::from_secs(seconds.max(1) as u64);
     let deadline = Instant::now() + duration;
@@ -403,6 +459,10 @@ mod tests {
         assert!(parec.contains(&"--channels=1".to_string()));
 
         let pw = Recorder::PwRecord.args(48_000);
+        // Raw mode is required: without it pw-record wraps stdout in a
+        // libsndfile container (WAV on PipeWire < 1.6, which cannot be
+        // written to a pipe at all; AU with a header on >= 1.6).
+        assert!(pw.contains(&"--raw".to_string()));
         let r = pw.iter().position(|a| a == "--rate").unwrap();
         assert_eq!(pw[r + 1], "48000");
         let f = pw.iter().position(|a| a == "--format").unwrap();
@@ -412,20 +472,77 @@ mod tests {
         assert_eq!(pw.last().unwrap(), "-"); // stdout target
     }
 
+    fn config_message(err: VoiceError) -> String {
+        match err {
+            VoiceError::Config(message) => message,
+            other => panic!("expected VoiceError::Config, got {other:?}"),
+        }
+    }
+
     #[test]
     fn recorder_preference_is_pipewire_then_pulse_then_alsa() {
-        // All present: PipeWire wins (routes through the user's audio server).
-        let all = detect_recorder_with(|_| true);
-        assert!(matches!(all, Some(Recorder::PwRecord)));
+        let all = candidate_recorders(|_| true, || true);
+        assert!(matches!(
+            all.as_slice(),
+            [Recorder::PwRecord, Recorder::Parec, Recorder::Arecord]
+        ));
 
-        // No PipeWire: PulseAudio next.
-        let no_pw = detect_recorder_with(|p| p != "pw-record");
-        assert!(matches!(no_pw, Some(Recorder::Parec)));
+        let no_pw = candidate_recorders(|p| p != "pw-record", || true);
+        assert!(matches!(
+            no_pw.as_slice(),
+            [Recorder::Parec, Recorder::Arecord]
+        ));
 
-        // alsa-utils only: arecord is the last resort.
-        let alsa_only = detect_recorder_with(|p| p == "arecord");
-        assert!(matches!(alsa_only, Some(Recorder::Arecord)));
+        let alsa_only = candidate_recorders(|p| p == "arecord", || true);
+        assert!(matches!(alsa_only.as_slice(), [Recorder::Arecord]));
+    }
 
-        assert!(detect_recorder_with(|_| false).is_none());
+    #[test]
+    fn old_pipewire_is_demoted_below_pulse_and_alsa() {
+        // pw-record present but `--raw` unsupported: it ranks last so parec is
+        // tried first, but it is not dropped — a misjudged probe must not block
+        // a working pw-record (the spawn is the source of truth).
+        let all_present_no_raw = candidate_recorders(|_| true, || false);
+        assert!(matches!(
+            all_present_no_raw.as_slice(),
+            [Recorder::Parec, Recorder::Arecord, Recorder::PwRecord]
+        ));
+    }
+
+    #[test]
+    fn sole_pipewire_stays_a_candidate_when_probe_says_no_raw() {
+        // The only recorder on PATH is a pw-record the probe rejects: still
+        // offer it so first_success can spawn-test it, rather than erroring out
+        // on a possible false negative.
+        let only_pw = require_recorders(|p| p == "pw-record", || false).unwrap();
+        assert!(matches!(only_pw.as_slice(), [Recorder::PwRecord]));
+    }
+
+    #[test]
+    fn no_recorder_on_path_is_an_error() {
+        let err = require_recorders(|_| false, || true).unwrap_err();
+        assert!(config_message(err).contains("no microphone recorder"));
+    }
+
+    #[test]
+    fn first_success_returns_first_ok_and_skips_later_candidates() {
+        let candidates = [Recorder::PwRecord, Recorder::Parec, Recorder::Arecord];
+        let (recorder, value) = first_success(&candidates, |r| match r {
+            Recorder::PwRecord => Err("pw-record exited immediately".to_string()),
+            Recorder::Parec => Ok(7u32),
+            Recorder::Arecord => panic!("arecord should not be reached after parec succeeds"),
+        })
+        .expect("parec succeeds");
+        assert!(matches!(recorder, Recorder::Parec));
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn first_success_reports_every_failure_when_all_fail() {
+        let candidates = [Recorder::PwRecord, Recorder::Parec];
+        let err = first_success::<()>(&candidates, |r| Err(format!("{} failed", r.program())))
+            .unwrap_err();
+        assert!(err.contains("pw-record failed"));
+        assert!(err.contains("parec failed"));
     }
 }

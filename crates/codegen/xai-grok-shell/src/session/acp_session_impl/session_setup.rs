@@ -22,16 +22,17 @@ impl SessionActor {
             xai_grok_telemetry::unified_log::error(
                 "sampling auth error",
                 Some(self.session_info.id.0.as_ref()),
-                Some(serde_json::json!(
-                    { "method" : method.map(| id | id.0.as_ref()), "error" :
-                    format!("{err}"), }
-                )),
+                Some(serde_json::json!({
+                    "method": method.map(|id| id.0.as_ref()),
+                    "error": format!("{err}"),
+                })),
             );
             return acp::Error::auth_required().data(msg);
         }
         map_sampling_err_to_acp(err)
     }
     /// Set up `[system, skill_reminder?]` — prefix is deferred to background.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(super) async fn initialize(&self, system_prompt: String) {
         let bridge = self.agent.borrow().tool_bridge().clone();
         bridge.on_skill_discovery_clear().await;
@@ -47,10 +48,11 @@ impl SessionActor {
             .replace_conversation(messages.clone());
         persist_chat_history_jsonl_sync(&self.session_info, &messages);
     }
-    /// Ensure the conversation carries the correct baseline skill
-    /// `<system-reminder>`: exactly one for an agent that has skills and uses reminders,
-    /// and none for an agent that renders skills inline via `<agent_skills>`
-    /// or when nothing is pending.
+    /// Ensure the conversation carries the correct baseline skill (and
+    /// workflow) `<system-reminder>`: exactly one for an agent that has
+    /// skills/workflows and uses reminders, and none for an agent that
+    /// renders skills inline via `<agent_skills>` with no workflows, or
+    /// when nothing is pending.
     ///
     /// Called from `initialize` (fresh start, conversation is just `[system]`)
     /// and the zero-turn harness rebuild (`handle_rebuild_agent_for_definition`,
@@ -68,6 +70,7 @@ impl SessionActor {
     ///
     /// Returns the drained effects so callers can honor `send_available_commands`
     /// on their own schedule.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(super) async fn inject_baseline_skill_reminder(
         &self,
         conversation: &mut Vec<ConversationItem>,
@@ -79,19 +82,40 @@ impl SessionActor {
         }
         conversation.retain(|item| {
             !matches!(
-                item, ConversationItem::User(u) if u.synthetic_reason ==
-                Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
+                item,
+                ConversationItem::User(u)
+                    if u.synthetic_reason
+                        == Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
             )
         });
-        let effects = bridge.apply_pending_skill_update().await?;
-        if let Some(item) = self.wrap_skill_reminder(&effects) {
-            conversation.push(item);
+        let effects = bridge.apply_pending_skill_update().await;
+        let skill_text = effects
+            .as_ref()
+            .and_then(|update| {
+                if is_cursor
+                    && update.kind
+                        == xai_grok_tools::types::skill_discovery_tracker::SkillUpdateKind::BaselineChange
+                {
+                    None
+                } else {
+                    update.system_reminder.as_deref()
+                }
+            });
+        if let Some(body) = crate::session::workflow::listing::merge_listing_sections(
+            skill_text,
+            self.workflow_listing_for_prompt().as_deref(),
+        ) {
+            let tag = self.reminder_wrapper_tag();
+            conversation.push(ConversationItem::system_reminder(format!(
+                "<{tag}>\n{body}\n</{tag}>"
+            )));
         }
-        Some(effects)
+        effects
     }
+    #[tracing::instrument(skip_all)]
     pub(super) async fn build_prefix_background(&self) -> String {
         let start = std::time::Instant::now();
-        if matches!(self.mcp_strategy, McpInitStrategy::Blocking) {
+        if matches!(self.mcp_strategy.get(), McpInitStrategy::Blocking) {
             use xai_grok_agent::prompt::user_message::UserMessageTemplate;
             let mcp_wait = match self.agent.borrow().definition().user_message_template {
                 UserMessageTemplate::Default => std::time::Duration::from_secs(15),
@@ -101,32 +125,36 @@ impl SessionActor {
         }
         let prefix = self.build_user_message_prefix().await;
         tracing::info!(
-            session_id = % self.session_info.id.0, elapsed_ms = start.elapsed()
-            .as_millis() as u64, "build_prefix_background: done"
+            session_id = %self.session_info.id.0,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "build_prefix_background: done"
         );
         prefix
     }
     /// Await the background prefix and inject at conversation index 1.
     /// Falls back to synchronous build on timeout (10s) or panic.
+    #[tracing::instrument(skip_all)]
     pub(super) async fn ensure_prefix_ready(&self) {
-        let Some(handle) = self.deferred_prefix.take() else {
+        let Some(mut handle) = self.deferred_prefix.take() else {
             return;
         };
         let start = std::time::Instant::now();
         const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let (prefix, source) = match tokio::time::timeout(WAIT_TIMEOUT, handle).await {
+        let (prefix, source) = match tokio::time::timeout(WAIT_TIMEOUT, &mut handle).await {
             Ok(Ok(p)) => (p, "background"),
             Ok(Err(join_err)) => {
                 tracing::warn!(
-                    session_id = % self.session_info.id.0, error = % join_err,
+                    session_id = %self.session_info.id.0,
+                    error = %join_err,
                     "ensure_prefix_ready: background task panicked, sync fallback"
                 );
                 (self.build_user_message_prefix().await, "sync_fallback")
             }
             Err(_elapsed) => {
+                handle.abort();
                 tracing::warn!(
-                    session_id = % self.session_info.id.0, timeout_ms = WAIT_TIMEOUT
-                    .as_millis() as u64,
+                    session_id = %self.session_info.id.0,
+                    timeout_ms = WAIT_TIMEOUT.as_millis() as u64,
                     "ensure_prefix_ready: background task not ready, sync fallback"
                 );
                 (self.build_user_message_prefix().await, "sync_fallback")
@@ -146,17 +174,16 @@ impl SessionActor {
             );
         }
         if let Some(personas_reminder) = self.agent.borrow().personas_user_reminder() {
-            let personas_at = conversation.len().min(
-                conversation
-                    .iter()
-                    .position(|item| {
-                        matches!(
-                            item, ConversationItem::User(u) if u.synthetic_reason
-                            .is_none()
-                        )
-                    })
-                    .unwrap_or(conversation.len()),
-            );
+            let personas_at = conversation
+                .len()
+                .min(
+                    conversation
+                        .iter()
+                        .position(|item| {
+                            matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none())
+                        })
+                        .unwrap_or(conversation.len()),
+                );
             conversation.insert(
                 personas_at,
                 ConversationItem::system_reminder(personas_reminder),
@@ -164,13 +191,16 @@ impl SessionActor {
         }
         self.chat_state_handle.replace_conversation(conversation);
         tracing::info!(
-            session_id = % self.session_info.id.0, source, elapsed_ms = start.elapsed()
-            .as_millis() as u64, "ensure_prefix_ready: done"
+            session_id = %self.session_info.id.0,
+            source,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "ensure_prefix_ready: done"
         );
     }
     /// Re-discover skills from disk, update the SkillManager baseline,
     /// and re-advertise slash commands to the client. Returns the number
     /// of skills discovered.
+    #[tracing::instrument(skip_all)]
     pub(super) async fn reload_skills_from_disk(&self) -> usize {
         let cwd = &self.session_info.cwd;
         let skills_config = crate::util::config::load_config().await.skills;
@@ -184,40 +214,71 @@ impl SessionActor {
         .await;
         let skill_count = new_skills.len();
         tracing::info!(
-            session_id = % self.session_info.id.0, skill_count,
+            session_id = %self.session_info.id.0,
+            skill_count,
             "Reloaded skills from disk",
         );
         let bridge = self.agent.borrow().tool_bridge().clone();
         bridge.update_skill_baseline(new_skills).await;
-        if let Some(effects) = bridge.apply_pending_skill_update().await {
-            self.apply_skill_update_effects(effects).await;
+        match bridge.apply_pending_skill_update().await {
+            Some(effects) => self.apply_skill_update_effects(effects).await,
+            None => self.send_available_commands_update().await,
         }
         skill_count
     }
+    /// Skills used for slash resolve, mid-turn interjection expansion, and
+    /// prompt skill listings. Same source as ACU: product REST for chat-kind
+    /// (TTL-cached; never disk), `SkillManager` for Build.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) async fn slash_skills_for_resolve(
+        &self,
+    ) -> Vec<xai_grok_tools::implementations::skills::types::SkillInfo> {
+        #[cfg(test)]
+        crate::session::slash_authority::record_skill_catalog_call();
+        match slash_commands::acu_skill_source(self.is_chat_kind) {
+            slash_commands::AcuSkillSource::Product => Vec::new(),
+            slash_commands::AcuSkillSource::Disk => {
+                let bridge = self.tool_bridge_handle();
+                bridge.slash_skills().await
+            }
+        }
+    }
     /// Send `AvailableCommandsUpdate` to the client.
     ///
-    /// Reads the current slash-command skill list from the tools layer
-    /// (`SkillManager`), NOT from `PromptContext`.
+    /// Chat-kind sessions advertise the product Skills REST catalog (same
+    /// source as `list_commands(kind=chat)`). Build sessions read disk skills
+    /// from the tools layer (`SkillManager`). Chat never falls back to disk.
+    /// Product REST failure (or missing auth) reuses the shared last-successful
+    /// product catalog (same as `list_commands(kind=chat)`); if none exists yet,
+    /// advertises builtins only (never invents product skill names, never disk).
+    /// Empty product success still advertises builtins.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(super) async fn send_available_commands_update(&self) {
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let skills = bridge.slash_skills().await;
+        let skills = match slash_commands::acu_skill_source(self.is_chat_kind) {
+            slash_commands::AcuSkillSource::Product => {
+                return;
+            }
+            slash_commands::AcuSkillSource::Disk => bridge.slash_skills().await,
+        };
         let tool_names: Vec<String> = bridge
             .tool_definitions()
             .await
             .into_iter()
             .map(|td| td.function.name)
             .collect();
-        let availability = self.build_command_availability(&tool_names);
-        self.maybe_reconcile_active_goal_without_harness().await;
+        let has_workflow_runs = !self.workflow_tracker().await.lock().list().is_empty();
+        let availability = self.build_command_availability(&tool_names, has_workflow_runs);
         self.maybe_reconcile_active_goal_without_plan().await;
-        let commands = slash_commands::available_commands(&skills, availability);
-        if commands.is_empty() {
-            return;
-        }
+        let (_, workflows) = self.named_workflow_snapshot();
+        let commands = slash_commands::available_commands(&skills, availability, &workflows);
         let meta = Some(slash_commands::build_tools_meta(&tool_names));
         tracing::info!(
-            session_id = % self.session_info.id.0, command_count = commands.len(),
-            tool_count = tool_names.len(), "Advertising available slash commands",
+            session_id = %self.session_info.id.0,
+            command_count = commands.len(),
+            tool_count = tool_names.len(),
+            is_chat_kind = self.is_chat_kind,
+            "Advertising available slash commands",
         );
         self.send_update(
             acp::SessionUpdate::AvailableCommandsUpdate(
@@ -270,6 +331,7 @@ impl SessionActor {
     /// Apply skill update effects: inject a system-reminder and refresh
     /// slash commands. Both default and compat agents receive mid-session
     /// discovery reminders.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(super) async fn apply_skill_update_effects(
         &self,
         effects: xai_grok_tools::types::skill_discovery_tracker::SkillUpdateEffects,
@@ -292,6 +354,7 @@ impl SessionActor {
             self.persist_announcement_state().await;
         }
     }
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(super) async fn flush_pending_skill_reminders(&self) {
         let activation = self.plan_mode.lock().take_pending_activation();
         if let Some(text) = activation {
@@ -327,6 +390,7 @@ impl SessionActor {
     /// context_window / max_completion_tokens if remote settings changed them.
     ///
     /// Skipped for BYOK users (no remote settings, no `/models-v2`).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(super) async fn maybe_refresh_model_metadata_on_resume(&self) {
         if !self.is_session_based_auth() {
             return;
@@ -355,7 +419,6 @@ impl SessionActor {
             threshold_secs = Self::IDLE_REFRESH_THRESHOLD_SECS,
             "Session resumed after idle — refreshing model metadata from cli-chat-proxy"
         );
-        let creds = self.chat_state_handle.get_credentials().await;
         let Some(ref am) = self.auth_manager else {
             tracing::debug!("No auth manager available for model metadata refresh");
             return;
@@ -392,20 +455,28 @@ impl SessionActor {
                 crate::http::process_client_mode(),
             )
             .timeout(std::time::Duration::from_secs(5));
-        let response = match request.send().await {
+        let built = match request.build() {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = % e, "Failed to fetch models for idle refresh");
+                tracing::warn!(error = %e, "Failed to build idle-refresh models request");
                 return;
             }
         };
+        let (response, stamp) =
+            match xai_grok_auth::execute_with_stamp(&middleware_client, built).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to fetch models for idle refresh");
+                    return;
+                }
+            };
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             crate::auth::attribution::record_consumer_401(
                 am,
                 None,
                 crate::auth::attribution::ConsumerKind::IdleResumeModelRefresh,
                 "",
-                creds.api_key.as_deref(),
+                stamp.as_ref().map(|s| s.0.as_str()),
             );
         }
         let result = if !response.status().is_success() {
@@ -455,6 +526,7 @@ impl SessionActor {
         }
     }
     /// Update cached sampling config if model metadata changed (from response headers).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(super) async fn handle_model_metadata_update(
         &self,
         metadata: crate::sampling::ResponseModelMetadata,
@@ -514,7 +586,7 @@ impl SessionActor {
     /// Inject the actor's managed Read-deny globs into the current ToolBridge so
     /// the Grep tool excludes policy-forbidden paths. No-op when empty. Called on
     /// session setup and re-called after an agent rebuild (the rebuilt bridge
-    /// starts empty), mirroring how `GoalUpdateHandle` is re-registered.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(super) async fn inject_deny_read_globs(&self) {
         if self.deny_read_globs.is_empty() {
             return;
@@ -528,6 +600,7 @@ impl SessionActor {
             .await;
     }
     /// Shared by `/session-info`, `/context`, and `GetSessionInfo`.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(super) async fn build_session_info(&self) -> SessionInfoData {
         let config = self.chat_state_handle.get_sampling_config().await;
         let model = config.as_ref().map(|c| c.model.clone());
@@ -537,15 +610,16 @@ impl SessionActor {
         let counts = self.chat_state_handle.get_conversation_counts().await;
         let turns = counts.user;
         let turn_index = self.chat_state_handle.get_prompt_index().await as u64;
-        tracing::info!(
-            turn_index, turns, resolved_model_id = ? model_metadata.resolved_model_id,
-            model_fingerprint = ? model_metadata.model_fingerprint, "build_session_info"
-        );
+        tracing::info!(turn_index, turns, resolved_model_id = ?model_metadata.resolved_model_id, model_fingerprint = ?model_metadata.model_fingerprint, "build_session_info");
         let model_fingerprint = model_metadata.model_fingerprint;
+        let show_model_fingerprint = model
+            .as_deref()
+            .map(|id| self.models_manager.model_show_model_fingerprint(id))
+            .unwrap_or(false);
         let resolved_model_id = model_metadata.resolved_model_id.filter(|resolved| {
             model
                 .as_deref()
-                .is_some_and(|m| should_show_resolved_model(m, resolved))
+                .is_some_and(|m| should_show_resolved_model(m, resolved, show_model_fingerprint))
         });
         let signals = self.signals_handle().snapshot().await;
         let compaction_count = signals.as_ref().map(|s| s.compaction_count).unwrap_or(0);
@@ -556,13 +630,12 @@ impl SessionActor {
             .as_ref()
             .map(xai_chat_state::estimate_system_message_tokens)
             .unwrap_or(0);
-        let use_backend_search =
-            self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
+        let backend_search_active = self.backend_search_active();
         let tool_defs: Vec<_> = self
             .prepare_tool_definitions_inner()
             .await
             .into_iter()
-            .filter(|td| !use_backend_search || td.function.name != "web_search")
+            .filter(|td| !backend_search_active || td.function.name != "web_search")
             .collect();
         let tool_definitions_count = tool_defs.len();
         let tool_definitions_tokens = xai_chat_state::estimate_tool_definitions_tokens(&tool_defs);
@@ -573,10 +646,6 @@ impl SessionActor {
         let usage_pct = xai_token_estimation::usage_percentage_u8(total_tokens, context_window);
         let api_backend = config.as_ref().map(|c| format!("{:?}", c.api_backend));
         let agent_name = self.agent.borrow().definition().name.clone();
-        let show_model_fingerprint = model
-            .as_deref()
-            .map(|id| self.models_manager.model_show_model_fingerprint(id))
-            .unwrap_or(false);
         let conversation_id = None;
         SessionInfoData {
             model,
@@ -607,12 +676,13 @@ impl SessionActor {
             },
         }
     }
-    /// Build the `/context` usage rows for the skills listing and the MCP
-    /// server listing (see [`TokenUsageCategory`]).
+    /// Build the `/context` usage rows for the skills listing, the workflow
+    /// listing, the MCP server listing, and AGENTS.md (see [`TokenUsageCategory`]).
     ///
     /// Under templated sessions, the skills row estimates the mid-session
     /// envelope; the baseline lives in the first-message preamble with the
     /// same rows, so the difference is a few dozen tokens of envelope text.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(super) async fn usage_categories(&self) -> Vec<TokenUsageCategory> {
         let bridge = self.tool_bridge_handle();
         let mut rows = Vec::new();
@@ -622,12 +692,30 @@ impl SessionActor {
                 listing.skill_count,
             ));
         }
+        if let Some((listing, count)) = self.workflow_listing_snapshot() {
+            rows.push(TokenUsageCategory::workflows_listing(&listing, count));
+        }
         if let Some(announcement) = self.mcp_announcement_snapshot().await {
             rows.push(TokenUsageCategory::mcp_servers(
                 &announcement.text,
                 announcement.server_count,
             ));
         }
+        if let Some(row) = self.agents_md_category() {
+            rows.push(row);
+        }
         rows
+    }
+    /// AGENTS.md row for `/context` and the session-start snapshot.
+    pub(super) fn agents_md_category(&self) -> Option<TokenUsageCategory> {
+        let agent = self.agent.borrow();
+        let file_count = agent.prompt_context().agents_md_files.len();
+        if file_count == 0 {
+            return None;
+        }
+        Some(TokenUsageCategory::agents_md(
+            &agent.agents_md_section()?,
+            file_count,
+        ))
     }
 }

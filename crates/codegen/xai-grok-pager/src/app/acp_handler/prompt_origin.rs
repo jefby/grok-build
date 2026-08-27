@@ -21,11 +21,47 @@ pub(crate) fn is_scheduler_fired_prompt(prompt_id: &str) -> bool {
     )
 }
 
+/// Replay: silent wakes and non-wake actor-run synthetics stay markerless.
+/// Error pierce applies only to real wakes. Direct-bash success stays
+/// markerless (matching live); cancel and error still paint.
+pub(crate) fn suppress_replay_marker_for_origin(
+    is_direct_bash: bool,
+    had_visible_output: bool,
+    prompt_id: &str,
+    stop: crate::app::turn_completion::TurnStopReason,
+) -> bool {
+    if is_direct_bash {
+        return matches!(stop, crate::app::turn_completion::TurnStopReason::EndTurn);
+    }
+    if is_wake_prompt(prompt_id) {
+        if matches!(stop, crate::app::turn_completion::TurnStopReason::Error) {
+            return false;
+        }
+        return !had_visible_output;
+    }
+    is_server_initiated_prompt(prompt_id) && !is_scheduler_fired_prompt(prompt_id)
+}
+
+/// Chatty rate-limited wake failure row. Shared by live `finish_wake_turn`,
+/// the busy live arm, and replay synthesis.
+pub(super) fn rate_limited_wake_failure_event(
+    agent_result: Option<&str>,
+    elapsed: Option<std::time::Duration>,
+) -> crate::scrollback::blocks::SessionEvent {
+    crate::scrollback::blocks::SessionEvent::TurnFailed {
+        error: agent_result
+            .map(str::to_string)
+            .unwrap_or_else(|| "rate limited".to_string()),
+        elapsed,
+    }
+}
+
 /// Returns true for the auto-wake turn families (`task-completed-…`,
-/// `subagent-completed-…`, `notifications-…`). These run non-adopted — no
+/// `subagent-completed-…`, `workflow-completed-…`, `notifications-…`). These run non-adopted — no
 /// `PromptResponse`, no viewer finalize — so their durable `TurnCompleted` is
 /// the only signal marking the back-to-idle point (see [`finish_wake_turn`];
-/// wake turns close markerless). Deliberately narrower than "non-adopted
+/// a chatty wake closes with a marker, a silent one stays markerless).
+/// Deliberately narrower than "non-adopted
 /// synthetic": goal turns render through the goal chip/loop chrome and
 /// `plan-resume-…` keeps its own markerless shape.
 pub(crate) fn is_wake_prompt(prompt_id: &str) -> bool {
@@ -33,6 +69,8 @@ pub(crate) fn is_wake_prompt(prompt_id: &str) -> bool {
         xai_grok_shell::session::PromptOrigin::from_prompt_id(prompt_id),
         xai_grok_shell::session::PromptOrigin::TaskCompleted { .. }
             | xai_grok_shell::session::PromptOrigin::SubagentCompleted { .. }
+            | xai_grok_shell::session::PromptOrigin::WorkflowCompleted { .. }
+            | xai_grok_shell::session::PromptOrigin::ParentAgentMessage { .. }
             | xai_grok_shell::session::PromptOrigin::NotificationDrain
     )
 }
@@ -85,10 +123,111 @@ pub(super) fn viewer_turn_anchor(turn_start_ms: Option<i64>) -> std::time::Insta
         .unwrap_or(now)
 }
 
-/// Close out a wake turn: markerless, but the stream must be finished here —
-/// wake turns skip `PromptResponse`, so this is the only flush site for an
-/// in-flight streamed entry (dead wakes included). Leaves a real turn's
-/// stop-hook stash pending for its own marker rail.
-pub(super) fn finish_wake_turn(agent: &mut AgentView) {
+/// Close out a wake turn — the only flush site for its in-flight streamed
+/// entries (wake turns skip `PromptResponse`). Markers: visible output closes
+/// with one; silence closes with none — except failures, which surface even
+/// when silent (the user's standing instruction stopped executing invisibly).
+/// Silent rate limits defer to the retry notifications, like the real-turn
+/// rails. A hook-denied wake follows the cancelled policy (no failure
+/// carve-out): the `HookAnnotation` warning attributes the deny but is not
+/// turn output, so a silent block closes without a marker.
+///
+/// `cancel_trigger` is the signal's `_meta.cancelTrigger`. `"send_now"` marks
+/// an internal cancel-and-send, so the `TurnCancelled` marker is suppressed
+/// (wire trigger wins; `expect_send_now_cancel` is the older-shell fallback).
+/// `cancellation_category` is the signal's `_meta.cancellationCategory`;
+/// `"HookDenied"` picks the blocked-by-a-hook marker.
+pub(super) fn finish_wake_turn(
+    agent: &mut AgentView,
+    prompt_id: &str,
+    stop_reason: &str,
+    agent_result: Option<&str>,
+    cancel_trigger: Option<&str>,
+    cancellation_category: Option<&str>,
+) {
+    use crate::scrollback::blocks::SessionEvent;
+
+    let had_output = agent.session.tracker.output_since_last_finish();
     agent.session.tracker.finish_turn(&mut agent.scrollback);
+    // The stored `turn_start_ms` may belong to an earlier turn (a silent wake
+    // streamed no deltas of its own; interleaved deltas can re-stamp it) —
+    // claim an elapsed only when the anchor is provably this wake's.
+    let anchor_is_ours = agent.turn_start_ms_prompt.as_deref() == Some(prompt_id);
+    let elapsed = if had_output && anchor_is_ours {
+        agent.turn_start_ms.and_then(|start_ms| {
+            let ms = chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(start_ms);
+            (ms >= 0).then(|| std::time::Duration::from_millis(ms as u64))
+        })
+    } else {
+        None
+    };
+    // Wire trigger carries this case; pid-matched fallback is consistency-only (do not take/clear).
+    let send_now_cancel = match cancel_trigger {
+        Some(trigger) => trigger == "send_now",
+        None => agent.expect_send_now_cancel.as_deref() == Some(prompt_id),
+    };
+    let already_failed = agent.failed_wake_marker_for.as_deref() == Some(prompt_id);
+    let elapsed_ms = crate::app::turn_completion::duration_to_elapsed_ms(elapsed);
+    let event = match stop_reason {
+        "error" | "rate_limit"
+            if already_failed || (stop_reason == "rate_limit" && !had_output) =>
+        {
+            None
+        }
+        "error" | "rate_limit" => {
+            agent.failed_wake_marker_for = Some(prompt_id.to_string());
+            if crate::app::dispatch::scrollback_has_recent_error_banner(&agent.scrollback) {
+                None
+            } else if stop_reason == "error" {
+                Some(SessionEvent::TurnFailed {
+                    error: crate::app::error_display::format_request_failure(
+                        None,
+                        None,
+                        agent_result.unwrap_or("unknown error"),
+                    )
+                    .message(),
+                    elapsed,
+                })
+            } else {
+                Some(rate_limited_wake_failure_event(agent_result, elapsed))
+            }
+        }
+        // Silent wakes stay markerless; the classifier does not know origins.
+        _ if !had_output => None,
+        _ => crate::app::turn_completion::terminal_marker(
+            crate::app::turn_completion::TerminalMarkerInput {
+                stop: crate::app::turn_completion::TurnStopReason::from(stop_reason),
+                elapsed_ms,
+                agent_result,
+                send_now_cancel,
+                cancellation_category,
+                error_banner_present: false,
+            },
+        ),
+    };
+    if event.is_some() {
+        crate::app::turn_completion::push_turn_terminal_marker(agent, event, Some(prompt_id));
+    }
+    // Wake turns are synthetic and never gated, so no hook detail exists here.
+    crate::app::turn_completion::note_hook_blocked_turn(
+        agent,
+        Some(prompt_id),
+        cancellation_category,
+        None,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_message_is_non_adopted_actor_turn() {
+        let prompt_id = "parent-message-msg-123";
+        assert!(is_server_initiated_prompt(prompt_id));
+        assert!(is_wake_prompt(prompt_id));
+        assert!(!should_adopt_running_prompt(prompt_id));
+    }
 }

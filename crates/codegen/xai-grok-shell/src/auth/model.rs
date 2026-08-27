@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use xai_grok_auth::bearer_suffix;
 
 use super::is_xai_oauth2_issuer;
 
@@ -11,7 +12,7 @@ const DEFAULT_EARLY_INVALIDATION_SECS: u64 = 300; // 5 minutes
 pub(super) const LEGACY_SCOPE: &str = "https://accounts.x.ai/sign-in";
 
 /// auth.json scope key for plain API key auth (desktop login, `grok login --api-key`).
-pub const API_KEY_SCOPE: &str = "xai::api_key";
+pub(super) const API_KEY_SCOPE: &str = "xai::api_key";
 
 const BLOCKED_REASON_NO_LOGS: &str = "BLOCKED_REASON_NO_LOGS";
 const BLOCKED_REASON_NO_LOGS_MODERATED: &str = "BLOCKED_REASON_NO_LOGS_MODERATED";
@@ -109,13 +110,13 @@ pub struct GrokAuth {
 impl std::fmt::Debug for GrokAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GrokAuth")
-            .field("key", &token_suffix(&self.key))
+            .field("key", &bearer_suffix(&self.key))
             .field("auth_mode", &self.auth_mode)
             .field("user_id", &self.user_id)
             .field("expires_at", &self.expires_at)
             .field(
                 "refresh_token",
-                &self.refresh_token.as_deref().map(token_suffix),
+                &self.refresh_token.as_deref().map(bearer_suffix),
             )
             .finish_non_exhaustive()
     }
@@ -161,7 +162,7 @@ impl GrokAuth {
     /// qualify; external-provider credentials qualify only when first-party
     /// (`is_xai_auth`), matching the built-in devbox login they replace.
     /// Plain API keys never do.
-    pub fn is_session_auth(&self) -> bool {
+    pub(crate) fn is_session_auth(&self) -> bool {
         match self.auth_mode {
             AuthMode::WebLogin | AuthMode::Oidc => true,
             AuthMode::External => self.is_xai_auth(),
@@ -184,7 +185,7 @@ impl GrokAuth {
     /// retention. Use this for trace-upload and research-data gates.
     /// Product analytics (`telemetry_enabled`) and user-facing sync
     /// features should use `is_zdr_team()` directly.
-    pub fn is_data_collection_disabled(&self) -> bool {
+    pub(crate) fn is_data_collection_disabled(&self) -> bool {
         self.is_zdr_team() || self.coding_data_retention_opt_out
     }
 
@@ -244,7 +245,7 @@ impl GrokAuth {
     /// ```ignore
     /// GrokAuth { key: "my-key".into(), ..GrokAuth::test_default() }
     /// ```
-    pub fn test_default() -> Self {
+    pub(crate) fn test_default() -> Self {
         Self {
             key: "test-key".into(),
             user_id: "test-user".into(),
@@ -299,16 +300,6 @@ pub(crate) struct UserInfo {
     pub(crate) subscription_tier: Option<String>,
 }
 
-/// Last 12 chars of a token string, safe for diagnostic logging.
-/// Uses the tail because JWT access tokens all share the same base64
-/// header prefix (`eyJ0eXAiOiJh…`); the tail (signature bytes) is
-/// unique per token and makes `key_changed` / `is_stale_snapshot`
-/// diagnostics meaningful.
-pub(crate) fn token_suffix(t: &str) -> &str {
-    let len = t.len();
-    if len > 12 { &t[len - 12..] } else { t }
-}
-
 /// Look up auth from the store by scope key.
 ///
 /// Legacy `WebLogin` tokens (from the pre-OIDC `grok login --legacy`
@@ -316,18 +307,26 @@ pub(crate) fn token_suffix(t: &str) -> &str {
 /// server-side which fails at high volume.  Skipping them here forces
 /// affected users to re-authenticate via OIDC on next launch.
 pub fn lookup_auth(map: &AuthStore, scope: &str) -> Option<GrokAuth> {
-    let auth = map.get(scope).cloned().or_else(|| {
-        if scope == LEGACY_SCOPE {
-            None
-        } else {
-            map.get(LEGACY_SCOPE).cloned()
-        }
-    })?;
+    let auth = map
+        .get(scope)
+        .cloned()
+        .or_else(|| inherited_lookup(map, scope))?;
     if auth.auth_mode == AuthMode::WebLogin {
         tracing::info!("auth: ignoring legacy WebLogin token — re-authentication required");
         return None;
     }
     Some(auth)
+}
+
+/// Falls back to a scope the active backend inherits, skipping the one already tried.
+fn inherited_lookup(map: &AuthStore, scope: &str) -> Option<GrokAuth> {
+    use crate::auth::backend::{ActiveAuthBackend, AuthBackend};
+
+    ActiveAuthBackend::default()
+        .inherited_scopes()
+        .iter()
+        .filter(|inherited| **inherited != scope)
+        .find_map(|inherited| map.get(*inherited).cloned())
 }
 
 /// Early-invalidation buffer. Override with `GROK_AUTH_EARLY_INVALIDATION_SECS`

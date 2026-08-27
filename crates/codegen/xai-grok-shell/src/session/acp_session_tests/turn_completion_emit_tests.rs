@@ -37,17 +37,25 @@ fn is_agent_message_delta(m: &PersistenceMsg) -> bool {
     )
 }
 
-/// Pull the `(prompt_id, stop_reason, agent_result)` of the first persisted
-/// `TurnCompleted`, if any.
-fn turn_completed_fields(msgs: &[PersistenceMsg]) -> Option<(String, String, Option<String>)> {
+/// Pull the `(prompt_id, stop_reason, agent_result, elapsed_ms)` of the first
+/// persisted `TurnCompleted`, if any.
+fn turn_completed_fields(
+    msgs: &[PersistenceMsg],
+) -> Option<(String, String, Option<String>, Option<u64>)> {
     msgs.iter().find_map(|m| match m {
         PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(n)) => match &n.update {
             XaiSessionUpdate::TurnCompleted {
                 prompt_id,
                 stop_reason,
                 agent_result,
+                elapsed_ms,
                 ..
-            } => Some((prompt_id.clone(), stop_reason.clone(), agent_result.clone())),
+            } => Some((
+                prompt_id.clone(),
+                stop_reason.clone(),
+                agent_result.clone(),
+                *elapsed_ms,
+            )),
             _ => None,
         },
         _ => None,
@@ -57,7 +65,7 @@ fn turn_completed_fields(msgs: &[PersistenceMsg]) -> Option<(String, String, Opt
 /// A minimal front pending input matching `prompt_id`. `queue_meta` is `None`
 /// so `handle_completion` does not also broadcast a `queue/changed`. The
 /// completion receiver is returned so the caller keeps it alive.
-fn pending_input(prompt_id: &str) -> (InputItem, oneshot::Receiver<PromptTurnResult>) {
+pub(super) fn pending_input(prompt_id: &str) -> (InputItem, oneshot::Receiver<PromptTurnResult>) {
     let (respond_to, rx) = oneshot::channel();
     let item = InputItem {
         prompt_id: prompt_id.to_string(),
@@ -69,13 +77,17 @@ fn pending_input(prompt_id: &str) -> (InputItem, oneshot::Receiver<PromptTurnRes
         screen_mode: None,
         verbatim: false,
         json_schema: None,
-        origin: crate::session::PromptOrigin::User,
+        input_origin: InputOrigin::new(crate::session::PromptOrigin::User),
         task_wake_fallback: None,
+        tool_overrides_update: None,
         respond_to,
         persist_ack: None,
         parsed_prompt_tx: None,
+        initial_child_prompt_ready: None,
         queue_meta: None,
+        queue_mutation_policy: QueueMutationPolicy::hidden(),
         send_now: false,
+        traceparent: None,
     };
     (item, rx)
 }
@@ -155,18 +167,21 @@ async fn normal_completion_persists_turn_completed_after_buffered_delta_flush() 
                         completion_kind: PromptCompletionKind::Completed,
                         structured_output: None,
                         usage: None,
+                        tool_overrides: None,
                     }),
+                    Some(0),
                 )
                 .await;
 
             let msgs = drain_persistence(&mut persistence_rx);
 
             // The terminal is persisted with the right fields...
-            let (prompt_id, stop_reason, agent_result) = turn_completed_fields(&msgs)
+            let (prompt_id, stop_reason, agent_result, elapsed_ms) = turn_completed_fields(&msgs)
                 .expect("a normal completion must persist a TurnCompleted");
             assert_eq!(prompt_id, "p1");
             assert_eq!(stop_reason, "end_turn");
             assert_eq!(agent_result, None);
+            assert_eq!(elapsed_ms, Some(0));
 
             // ...after the flushed buffered delta on the same persistence stream.
             let delta_idx = msgs
@@ -217,15 +232,61 @@ async fn error_completion_persists_turn_completed_with_error_detail() {
                 .handle_completion(
                     "p-err".to_string(),
                     Err(acp::Error::internal_error().data("boom")),
+                    Some(0),
                 )
                 .await;
 
             let msgs = drain_persistence(&mut persistence_rx);
-            let (prompt_id, stop_reason, agent_result) = turn_completed_fields(&msgs)
+            let (prompt_id, stop_reason, agent_result, elapsed_ms) = turn_completed_fields(&msgs)
                 .expect("a failed completion must persist a TurnCompleted");
             assert_eq!(prompt_id, "p-err");
             assert_eq!(stop_reason, "error");
             assert_eq!(agent_result.as_deref(), Some("boom"));
+            assert_eq!(elapsed_ms, Some(0));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completion_without_elapsed_persists_none() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            *actor
+                .current_prompt_id
+                .lock()
+                .expect("current_prompt_id mutex poisoned") = Some("p-none".to_string());
+            let (item, _rx) = pending_input("p-none");
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(item);
+            }
+
+            actor
+                .handle_completion(
+                    "p-none".to_string(),
+                    Ok(PromptTurnOk {
+                        stop_reason: acp::StopReason::EndTurn,
+                        total_tokens: 0,
+                        turn_snapshot: None,
+                        completion_kind: PromptCompletionKind::Completed,
+                        structured_output: None,
+                        usage: None,
+                        tool_overrides: None,
+                    }),
+                    None,
+                )
+                .await;
+
+            let msgs = drain_persistence(&mut persistence_rx);
+            let (_, _, _, elapsed_ms) = turn_completed_fields(&msgs)
+                .expect("a completion with no elapsed must persist a TurnCompleted");
+            assert_eq!(elapsed_ms, None);
         })
         .await;
 }
@@ -248,26 +309,26 @@ async fn cancellation_persists_turn_completed_cancelled() {
             let (item, _rx) = pending_input("running");
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    })
-                    .abort_handle(),
-                });
+                state.running_task = Some(running_task_stub("running"));
                 state.pending_inputs.push_back(item);
             }
 
-            actor
-                .cancel_running_task(true, false, false, Some("ctrl_c".to_string()))
+            let _ = actor
+                .cancel_running_task(crate::session::CancelOptions {
+                    cancel_subagents: true,
+                    trigger: Some(crate::session::CancelTrigger::CtrlC),
+                    user_initiated: true,
+                    ..Default::default()
+                })
                 .await;
 
             let msgs = drain_persistence(&mut persistence_rx);
-            let (prompt_id, stop_reason, agent_result) =
+            let (prompt_id, stop_reason, agent_result, elapsed_ms) =
                 turn_completed_fields(&msgs).expect("a cancel must persist a TurnCompleted");
             assert_eq!(prompt_id, "running");
             assert_eq!(stop_reason, "cancelled");
             assert_eq!(agent_result, None);
+            assert!(elapsed_ms.is_some(), "cancel must persist elapsed_ms");
             // Ctrl+C also stamps a trigger (informational; only send_now changes client behavior).
             assert_eq!(
                 turn_completed_meta(&msgs).and_then(|m| m
@@ -277,6 +338,47 @@ async fn cancellation_persists_turn_completed_cancelled() {
                 Some("ctrl_c".to_string()),
                 "a Ctrl+C cancel stamps its trigger on the terminal meta"
             );
+        })
+        .await;
+}
+
+/// A cancel that races ahead of promote has a pin but no running task. Persist
+/// `elapsed_ms: None` so resume can tell unknown duration from a 0ms turn.
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_without_running_task_persists_none_elapsed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            *actor
+                .current_prompt_id
+                .lock()
+                .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
+            let (item, _rx) = pending_input("running");
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(item);
+            }
+
+            let _ = actor
+                .cancel_running_task(crate::session::CancelOptions {
+                    cancel_subagents: true,
+                    trigger: Some(crate::session::CancelTrigger::CtrlC),
+                    user_initiated: true,
+                    ..Default::default()
+                })
+                .await;
+
+            let msgs = drain_persistence(&mut persistence_rx);
+            let (prompt_id, stop_reason, _, elapsed_ms) = turn_completed_fields(&msgs)
+                .expect("a pin-only cancel must persist a TurnCompleted");
+            assert_eq!(prompt_id, "running");
+            assert_eq!(stop_reason, "cancelled");
+            assert_eq!(elapsed_ms, None);
         })
         .await;
 }
@@ -317,13 +419,7 @@ async fn send_now_cancel_in_completion_race_window_still_persists_turn_completed
             let (item, _rpc_rx) = pending_input("running");
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    })
-                    .abort_handle(),
-                });
+                state.running_task = Some(running_task_stub("running"));
                 state.pending_inputs.push_back(item);
             }
 
@@ -331,10 +427,11 @@ async fn send_now_cancel_in_completion_race_window_still_persists_turn_completed
             actor.cancel_turn_for_send_now(&mut replay_buffer).await;
 
             let msgs = drain_persistence(&mut persistence_rx);
-            let (prompt_id, stop_reason, _) = turn_completed_fields(&msgs)
+            let (prompt_id, stop_reason, _, elapsed_ms) = turn_completed_fields(&msgs)
                 .expect("a send-now cancel with a cleared pin must still persist a TurnCompleted");
             assert_eq!(prompt_id, "running");
             assert_eq!(stop_reason, "cancelled");
+            assert!(elapsed_ms.is_some());
             let meta = turn_completed_meta(&msgs).expect("terminal must carry _meta");
             assert_eq!(
                 meta.get("cancelTrigger").and_then(|v| v.as_str()),
@@ -363,13 +460,7 @@ async fn send_now_cancel_stamps_cancel_trigger_on_turn_end() {
             let (item, rpc_rx) = pending_input("running");
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    })
-                    .abort_handle(),
-                });
+                state.running_task = Some(running_task_stub("running"));
                 state.pending_inputs.push_back(item);
             }
 
@@ -378,10 +469,11 @@ async fn send_now_cancel_stamps_cancel_trigger_on_turn_end() {
             actor.cancel_turn_for_send_now(&mut replay_buffer).await;
 
             let msgs = drain_persistence(&mut persistence_rx);
-            let (prompt_id, stop_reason, _) = turn_completed_fields(&msgs)
+            let (prompt_id, stop_reason, _, elapsed_ms) = turn_completed_fields(&msgs)
                 .expect("a send-now cancel must persist a TurnCompleted");
             assert_eq!(prompt_id, "running");
             assert_eq!(stop_reason, "cancelled");
+            assert!(elapsed_ms.is_some());
             let meta = turn_completed_meta(&msgs).expect("terminal must carry _meta");
             assert_eq!(
                 meta.get("cancelTrigger").and_then(|v| v.as_str()),
@@ -425,8 +517,11 @@ async fn send_now_cancel_stamps_cancel_trigger_on_turn_end() {
         .await;
 }
 
+/// A hook-denied cancel stamps `_meta.cancellationCategory == "HookDenied"`
+/// on the durable `TurnCompleted` terminal — the wire value shipped clients
+/// match to render the blocked-by-a-hook copy.
 #[tokio::test(flavor = "current_thread")]
-async fn pristine_rewind_cancel_emits_no_turn_completed() {
+async fn hook_denied_cancel_stamps_cancellation_category_on_turn_end() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -435,7 +530,67 @@ async fn pristine_rewind_cancel_emits_no_turn_completed() {
             let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
 
-            // A pristine, rewindable in-flight turn at the front of the queue.
+            // A running turn with its prompt queued at the front (owned).
+            *actor
+                .current_prompt_id
+                .lock()
+                .expect("current_prompt_id mutex poisoned") = Some("p-hook".to_string());
+            let (item, _rx) = pending_input("p-hook");
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(item);
+            }
+
+            // The completion a `UserPromptSubmit` hook denial resolves the
+            // turn with (`TurnOutcome::Cancelled { category: HookDenied }`).
+            actor
+                .handle_completion(
+                    "p-hook".to_string(),
+                    Ok(PromptTurnOk {
+                        stop_reason: acp::StopReason::Cancelled,
+                        total_tokens: 0,
+                        turn_snapshot: None,
+                        completion_kind: PromptCompletionKind::Cancelled {
+                            category: Some(
+                                crate::session::events::CancellationCategory::HookDenied,
+                            ),
+                            context: None,
+                        },
+                        structured_output: None,
+                        usage: None,
+                        tool_overrides: None,
+                    }),
+                    Some(0),
+                )
+                .await;
+
+            let msgs = drain_persistence(&mut persistence_rx);
+            let (prompt_id, stop_reason, _, elapsed_ms) = turn_completed_fields(&msgs)
+                .expect("a hook-denied cancel must persist a TurnCompleted");
+            assert_eq!(prompt_id, "p-hook");
+            assert_eq!(stop_reason, "cancelled");
+            assert_eq!(elapsed_ms, Some(0));
+            let meta = turn_completed_meta(&msgs).expect("terminal must carry _meta");
+            assert_eq!(
+                meta.get("cancellationCategory").and_then(|v| v.as_str()),
+                Some("HookDenied"),
+                "the terminal `_meta` must pin the hook-denied category encoding"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn no_output_rewind_cancel_emits_no_turn_completed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            // An in-flight turn with no output yet at the front of the queue.
             *actor
                 .current_prompt_id
                 .lock()
@@ -444,26 +599,20 @@ async fn pristine_rewind_cancel_emits_no_turn_completed() {
             {
                 let mut state = actor.state.lock().await;
                 state.rewindable = true;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "rw".into(),
-                    handle: tokio::task::spawn_local(async {
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    })
-                    .abort_handle(),
-                });
+                state.running_task = Some(running_task_stub("rw"));
                 state.pending_inputs.push_back(item);
             }
 
-            // rewind_if_pristine = true on a rewindable turn takes the rewind
+            // A RewindIfNoOutput cancel on a rewindable turn takes the rewind
             // path: the turn is treated as UNSENT, so — in lock-step with the
             // legacy emit_turn_ended — NO durable terminal is emitted (else
             // replay would finalize a turn that was rewound, not completed).
-            actor.cancel_running_task(false, false, true, None).await;
+            let _ = actor.cancel_running_task(crate::session::CancelOptions { history: crate::session::CancelHistoryDisposition::RewindIfNoOutput { prompt_id: None }, user_initiated: true, ..Default::default() }).await;
 
             let msgs = drain_persistence(&mut persistence_rx);
             assert!(
                 turn_completed_fields(&msgs).is_none(),
-                "a pristine rewind cancel treats the turn as unsent and must persist no TurnCompleted"
+                "a rewind cancel before any output treats the turn as unsent and must persist no TurnCompleted"
             );
         })
         .await;
@@ -501,7 +650,9 @@ async fn removed_from_queue_completion_emits_no_turn_completed() {
                         completion_kind: PromptCompletionKind::RemovedFromQueue,
                         structured_output: None,
                         usage: None,
+                        tool_overrides: None,
                     }),
+                    Some(0),
                 )
                 .await;
 
@@ -544,7 +695,9 @@ async fn unknown_prompt_completion_emits_no_turn_completed() {
                         completion_kind: PromptCompletionKind::Completed,
                         structured_output: None,
                         usage: None,
+                        tool_overrides: None,
                     }),
+                    Some(0),
                 )
                 .await;
 

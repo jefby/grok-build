@@ -58,6 +58,7 @@ fn message_delta_with_stop(stop: messages::StopReason) -> MessageStreamEvent {
     MessageStreamEvent::MessageDelta {
         delta: MessageDeltaBody {
             stop_reason: Some(stop),
+            stop_sequence: None,
             stop_details: None,
         },
         usage: MessageDeltaUsage {
@@ -75,6 +76,7 @@ fn message_delta_refusal_with_explanation(explanation: &str) -> MessageStreamEve
     MessageStreamEvent::MessageDelta {
         delta: MessageDeltaBody {
             stop_reason: Some(messages::StopReason::Refusal),
+            stop_sequence: None,
             stop_details: Some(messages::StopDetails {
                 r#type: Some("refusal".to_string()),
                 category: Some("frontier_llm".to_string()),
@@ -141,6 +143,10 @@ async fn text_block_assembles_into_completed_response() {
             assert_eq!(a.content.as_ref(), "Hello, world!");
             assert_eq!(a.model_id.as_deref(), Some("messages-compatible-model"));
             assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            // Provider message id and the verbatim wire stop reason survive
+            // onto the response (collapsed `stop_reason` loses the string).
+            assert_eq!(response.message_id.as_deref(), Some("msg_1"));
+            assert_eq!(response.raw_stop_reason.as_deref(), Some("end_turn"));
             let u = response.usage.as_ref().expect("usage extracted");
             assert_eq!(u.prompt_tokens, 10);
             assert_eq!(u.completion_tokens, 5);
@@ -208,6 +214,61 @@ async fn thinking_block_emits_reasoning_channel_and_preserved_in_response() {
     }
 }
 
+/// `thinking(sig1) → text → thinking(sig2)` must surface each thinking block's
+/// OWN signature, in order, on its own `ReasoningCompleted` (emitted at that
+/// block's stop) — so the per-index signature reaches the headless reducer and
+/// each block keeps its own signature rather than collapsing to one.
+#[tokio::test]
+async fn multiple_thinking_blocks_emit_per_block_signatures_in_order() {
+    let thinking_block = |index: u32, text: &str, sig: &str| {
+        vec![
+            Ok(MessageStreamEvent::ContentBlockStart {
+                index,
+                content_block: ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: String::new(),
+                },
+            }),
+            Ok(MessageStreamEvent::ContentBlockDelta {
+                index,
+                delta: StreamDelta::ThinkingDelta {
+                    thinking: text.into(),
+                },
+            }),
+            Ok(MessageStreamEvent::ContentBlockDelta {
+                index,
+                delta: StreamDelta::SignatureDelta {
+                    signature: sig.into(),
+                },
+            }),
+            Ok(block_stop(index)),
+        ]
+    };
+    let mut events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![Ok(message_start())];
+    events.extend(thinking_block(0, "first", "sig-1"));
+    events.push(Ok(text_block_start(1)));
+    events.push(Ok(text_delta(1, "interlude")));
+    events.push(Ok(block_stop(1)));
+    events.extend(thinking_block(2, "second", "sig-2"));
+    events.push(Ok(MessageStreamEvent::MessageStop));
+
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    let sigs: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match e {
+            SamplingEvent::ReasoningCompleted { signature, .. } => Some(signature.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sigs,
+        vec!["sig-1", "sig-2"],
+        "each thinking block emits its own signature in order"
+    );
+}
+
 #[tokio::test]
 async fn tool_use_block_assembles_into_tool_call() {
     let tool_start = MessageStreamEvent::ContentBlockStart {
@@ -216,6 +277,8 @@ async fn tool_use_block_assembles_into_tool_call() {
             id: "call_xyz".into(),
             name: "do_thing".into(),
             input: serde_json::json!({}),
+            // Set: a parser matching only the absent case must fail here.
+            cache_control: Some(xai_grok_sampling_types::messages::CacheControl::ephemeral()),
         },
     };
     let arg_delta_1 = MessageStreamEvent::ContentBlockDelta {
@@ -371,11 +434,75 @@ async fn pause_turn_and_unknown_stop_reasons_complete_as_stop() {
     }
 }
 
-/// Pins the model_context_window_exceeded decision: it stays in the
-/// max_tokens truncation class (fatal, non-retryable), not the
-/// context-length Api class.
+/// The most common wire cell: a plain `max_tokens` stop with text only
+/// completes with `stop_reason=Length` and the partial preserved.
 #[tokio::test]
-async fn model_context_window_exceeded_fails_as_max_tokens_truncation() {
+async fn max_tokens_text_only_completes_with_length_stop() {
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(text_block_start(0)),
+        Ok(text_delta(0, "cut answ")),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::MaxTokens)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    match evs.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
+            assert_eq!(response.assistant_text(), "cut answ");
+        }
+        other => panic!("expected Completed(Length), got {other:?}"),
+    }
+}
+
+/// A max_tokens stop carrying a completed tool_use block keeps
+/// `stop_reason=Length` — the ToolCalls override must not mask the
+/// truncation (the block's arguments may be a silently-truncated prefix).
+#[tokio::test]
+async fn max_tokens_with_tool_use_keeps_length_stop() {
+    let tool_start = MessageStreamEvent::ContentBlockStart {
+        index: 0,
+        content_block: ContentBlock::ToolUse {
+            id: "call_cut".into(),
+            name: "do_thing".into(),
+            input: serde_json::json!({}),
+            cache_control: None,
+        },
+    };
+    let arg_delta = MessageStreamEvent::ContentBlockDelta {
+        index: 0,
+        delta: StreamDelta::InputJsonDelta {
+            partial_json: "{\"x\": \"trunc".into(),
+        },
+    };
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(tool_start),
+        Ok(arg_delta),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::MaxTokens)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    match evs.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
+            assert_eq!(response.tool_calls().len(), 1, "tool call still carried");
+        }
+        other => panic!("expected Completed(Length), got {other:?}"),
+    }
+}
+
+/// Pins the model_context_window_exceeded decision: maps to the Length stop
+/// class and COMPLETES with the partial preserved — fail-vs-salvage belongs
+/// to `drive_l2`, not this transform.
+#[tokio::test]
+async fn model_context_window_exceeded_completes_with_length_stop() {
     let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
         Ok(message_start()),
         Ok(text_block_start(0)),
@@ -389,20 +516,16 @@ async fn model_context_window_exceeded_fails_as_max_tokens_truncation() {
     let raw = stream::iter(events).boxed();
     let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
 
-    assert!(
-        !evs.iter()
-            .any(|e| matches!(e, SamplingEvent::Completed { .. })),
-        "context-window truncation must not complete: {evs:?}"
-    );
     match evs.last().unwrap() {
-        SamplingEvent::Failed { error, .. } => {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
             assert_eq!(
-                error.kind,
-                crate::events::SamplingErrorKind::MaxTokensTruncation
+                response.assistant_text(),
+                "truncated answ",
+                "partial content must be preserved"
             );
-            assert!(!error.is_retryable, "truncation is deterministic");
         }
-        other => panic!("expected Failed(MaxTokensTruncation), got {other:?}"),
+        other => panic!("expected Completed(Length), got {other:?}"),
     }
 }
 
@@ -416,6 +539,7 @@ async fn refusal_after_tool_use_blocks_keeps_tool_calls_stop_reason() {
             id: "call_refused".into(),
             name: "do_thing".into(),
             input: serde_json::json!({}),
+            cache_control: None,
         },
     };
     let arg_delta = MessageStreamEvent::ContentBlockDelta {
@@ -464,6 +588,9 @@ async fn server_error_event_yields_failed_500() {
             assert_eq!(error.kind, crate::events::SamplingErrorKind::Api);
             assert_eq!(error.status_code, Some(500));
             assert!(error.message.contains("overloaded_error"));
+            // Messages error events have no code slot; a code appearing here
+            // would make typed events eligible for a destructive image strip.
+            assert_eq!(error.error_code, None);
         }
         other => panic!("expected Failed, got {other:?}"),
     }
@@ -571,6 +698,7 @@ fn message_delta_with_cache(
     MessageStreamEvent::MessageDelta {
         delta: MessageDeltaBody {
             stop_reason: Some(messages::StopReason::EndTurn),
+            stop_sequence: None,
             stop_details: None,
         },
         usage: MessageDeltaUsage {
@@ -618,6 +746,7 @@ async fn prompt_tokens_sums_all_three_anthropic_buckets() {
 
     assert_eq!(usage.prompt_tokens, 100 + 5000 + 200);
     assert_eq!(usage.cached_prompt_tokens, 5000);
+    assert_eq!(usage.cache_creation_prompt_tokens, 200);
     assert_eq!(usage.completion_tokens, 7);
     assert_eq!(usage.total_tokens, 100 + 5000 + 200 + 7);
 }
@@ -635,6 +764,7 @@ async fn message_delta_cache_fields_override_message_start() {
 
     assert_eq!(usage.prompt_tokens, 10 + 900 + 50);
     assert_eq!(usage.cached_prompt_tokens, 900);
+    assert_eq!(usage.cache_creation_prompt_tokens, 50);
     assert_eq!(usage.completion_tokens, 4);
 }
 

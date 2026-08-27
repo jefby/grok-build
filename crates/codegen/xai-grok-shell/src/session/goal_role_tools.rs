@@ -18,8 +18,6 @@ use xai_grok_tools::types::tool::ToolKind;
 /// Resolved client-facing tool names for a role's prompt placeholders.
 ///
 /// Built parent-side from the role's resolved toolset, with one literal
-/// fallback per kind (mirroring the `unwrap_or_else(|| "update_goal".into())`
-/// pattern in `resolve_goal_tool_names`). An explicit `{model, agent_type}`
 /// role draws its names from the `describe_subagent_type` summary (so a
 /// `name_override` is reflected); an inherit / fail-open role draws them from
 /// the parent tool bridge. `{TOOLSET_TOOLS}` enumerates the role's toolset for
@@ -579,7 +577,7 @@ pub(crate) mod tests {
              {WEB_SEARCH_TOOL} {WEB_FETCH_TOOL}{TOOLSET_TOOLS}";
         let out = tn.apply(template);
         assert!(out.starts_with("rd ls gr wr ex ws wf"));
-        assert!(out.contains("Tools available to you for this review:"));
+        assert!(out.contains("`rd`") && out.contains("`wf`"));
         assert_no_tool_placeholders(&out);
     }
 

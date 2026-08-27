@@ -4,7 +4,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
-use super::content::{format_bytes, format_mime};
+use super::content::format_mime;
 use super::geometry::{overlay_geometry, plan_image_preview};
 use super::*;
 use crate::terminal::image::{GraphicsProtocol, set_protocol_for_test};
@@ -114,15 +114,22 @@ fn paint_pixels_with_path_returns_footer_and_exact_transmission() {
         text.contains("Path: /tmp/logo.png"),
         "rendered footer missing path: {text:?}",
     );
-    assert!(escapes.as_str().starts_with(&format!(
-        "\x1b[{};{}H",
-        placement.y + 1,
-        placement.x + 1
-    )));
+    let esc = escapes.as_str();
     assert!(
-        escapes
-            .as_str()
-            .contains(&format!("c={},r={}", placement.cols, placement.rows))
+        esc.contains("a=d,d=i"),
+        "first paint must delete id 1 before placing: {esc}"
+    );
+    assert!(
+        esc.contains(&format!("\x1b[{};{}H", placement.y + 1, placement.x + 1)),
+        "first paint must CUP to the placement cell: {esc}"
+    );
+    assert!(
+        esc.contains("a=T"),
+        "first paint must be one transmit+display: {esc}"
+    );
+    assert!(
+        esc.contains(&format!("c={},r={}", placement.cols, placement.rows)),
+        "placement geometry missing: {esc}"
     );
 }
 
@@ -189,13 +196,10 @@ fn geometry_honors_plan_specific_minima() {
 }
 
 #[test]
-fn formatting_helpers_cover_known_and_unknown_values() {
+fn format_mime_covers_known_and_unknown_values() {
     assert_eq!(format_mime("image/png"), "PNG");
     assert_eq!(
         format_mime("application/octet-stream"),
         "application/octet-stream"
     );
-    assert_eq!(format_bytes(512), "512 B");
-    assert_eq!(format_bytes(1536), "1.5 KB");
-    assert_eq!(format_bytes(2_500_000), "2.4 MB");
 }

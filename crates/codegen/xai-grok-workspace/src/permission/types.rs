@@ -50,12 +50,30 @@ pub struct PermissionEvent {
     /// The trigger that produced this decision, distinct from `prompt_outcome`
     /// (which records the user's choice when prompted). Lets a trace show *why*
     /// a request reached a prompt even when `user_prompted=true`. Values:
-    /// yolo, policy_allow, policy_deny, policy_ask, auto_fast_path,
-    /// auto_classifier_allow, auto_classifier_block, sandbox_auto,
-    /// persisted_grant, session_grant, static_allowlist, safe_command,
-    /// session_deny, prompt_deny, needs_user, requester_gone.
+    /// yolo, policy_allow, policy_deny, policy_ask, bash_command_gate_ask,
+    /// shell_file_gate_ask, auto_fast_path,
+    /// auto_classifier_allow, auto_classifier_deny,
+    /// auto_classifier_timeout, auto_classifier_unavailable, auto_denial_limit,
+    /// sandbox_auto, persisted_grant, session_grant, static_allowlist, safe_command,
+    /// session_deny, prompt_deny, needs_user, bash_request_floor, opaque_shell,
+    /// requester_gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_reason: Option<String>,
+    /// Auto-classifier path: "llm" | "heuristic" | "timeout" |
+    /// "transport_error" | "fast_path".
+    /// Absent when auto mode did not classify or take its fast path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_source: Option<String>,
+    /// Elapsed milliseconds spent in classification alone, including heuristic work;
+    /// absent when no classifier ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_latency_ms: Option<u64>,
+    /// Consecutive auto-classifier denials at decision time; absent outside auto mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_denials_consecutive: Option<u32>,
+    /// Total auto-classifier denials at decision time; absent outside auto mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_denials_total: Option<u32>,
     /// Elapsed milliseconds from the actor dequeuing this request to the decision
     /// resolving. The timer starts at dequeue, so it excludes time the request
     /// waited in the channel behind others; small for fast auto paths but
@@ -68,6 +86,43 @@ pub struct PermissionEvent {
     /// `user_prompted=true` events in the turn, not this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_depth: Option<u32>,
+    /// Ordered, deduplicated classifier finding tokens for this request. Three
+    /// distinct states (do not conflate `None` with `Some([])`):
+    /// - `None`: legacy trace, or the request never entered the Auto classifier
+    ///   route (fast-path allow, policy/gate decision, non-Bash access).
+    /// - `Some([])`: the classifier route was selected and the exact attempted
+    ///   assessment was empty. This is *not* a proven-clean classification.
+    /// - `Some(tokens)`: the classifier route was selected with these findings.
+    /// Projected once from the exact `BashSecurityAssessment` handed to the
+    /// classifier (`BashSecurityAssessment::tokens`); telemetry/traces never
+    /// recompute findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_findings: Option<Vec<String>>,
+    /// Classifier verdict when the Auto classifier route produced one:
+    /// `"allow" | "block" | "unavailable"`. `None` when the request never
+    /// reached a classifier verdict (legacy, fast path, non-classified route, or
+    /// requester gone mid-classify).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_verdict: Option<String>,
+    /// Whether the `remember_tool_approvals` gate was enabled for this
+    /// decision. `None` on legacy traces only; the manager always sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember_tool_approvals: Option<bool>,
+}
+/// A permission decision plus the authoritative manager [`PermissionEvent`] that
+/// produced it. The manager builds exactly one event per decision, sends one
+/// clone to the trace `event_tx`, and returns the identical event here so the
+/// shell can source content-free analytics fields (permission mode, wait time,
+/// classifier verdict/findings) from the manager rather than re-deriving them.
+///
+/// `event` is `None` for event-less paths (`AllowAll`, or a manager channel
+/// send/receive failure). Callers must omit manager-only analytics fields in
+/// that case instead of fabricating them. The shell never re-enqueues the
+/// returned event — the manager already emitted the sole trace copy.
+#[derive(Debug, Clone)]
+pub struct PermissionResolution {
+    pub decision: Decision,
+    pub event: Option<PermissionEvent>,
 }
 /// Identifies the type of client connecting to the agent.
 /// Used to determine which permission UI features to enable
@@ -140,8 +195,17 @@ impl ClientType {
             Self::Desktop => "desktop",
         }
     }
+    /// Whether a classifier Block can raise a permission prompt for this client.
+    /// Generic (headless / unidentified) cannot: a `Cancelled` prompt aborts the
+    /// turn, so its Block stays `PolicyDeny`. Every other variant — including any
+    /// added later — defaults to prompting. Which client type a session gets is
+    /// the manager's concern, not this pure predicate's.
+    pub const fn can_present_permission_prompt(self) -> bool {
+        !matches!(self, Self::Generic)
+    }
 }
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum AccessKind {
     Read(Option<String>),
     Grep {
@@ -159,6 +223,11 @@ pub enum AccessKind {
     },
     WebFetch(String),
     WebSearch(String),
+    /// Send content to an active subagent. Carries destination identity only;
+    /// model-authored message text never enters permission state or telemetry.
+    AgentMessage {
+        subagent_id: String,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -211,8 +280,12 @@ impl<'de> Deserialize<'de> for EditPolicy {
         deserializer.deserialize_str(V)
     }
 }
+/// The requesting session's execution cwd for one permission request. Shared
+/// parent/subagent managers serve sessions whose cwd differs from the
+/// manager's, so path rules and edit-target resolution must anchor to where
+/// the requesting tool actually resolves paths, not where the manager lives.
 #[derive(Debug, Clone)]
-pub struct EditPathContext {
+pub struct RequestPathContext {
     pub real_cwd: std::path::PathBuf,
     pub display_cwd: Option<std::path::PathBuf>,
 }
@@ -221,8 +294,8 @@ pub enum PermissionCommand {
     Request {
         access: AccessKind,
         tool_call_update: acp::ToolCallUpdate,
-        edit_path_context: Option<EditPathContext>,
-        respond_to: oneshot::Sender<Decision>,
+        path_context: Option<RequestPathContext>,
+        respond_to: oneshot::Sender<PermissionResolution>,
         /// Session ID originating this request. Used to attribute
         /// permission events to child subagents.
         session_id: Option<String>,
@@ -262,6 +335,10 @@ impl From<&xai_grok_tools::types::ToolInput> for AccessKind {
             | ToolInput::WaitTasks(_)
             | ToolInput::KillTask(_)
             | ToolInput::Skill(_) => AccessKind::Read(None),
+            ToolInput::Task(t) => AccessKind::Edit(format!("task:{}", t.subagent_type)),
+            ToolInput::SendSubagentMessage(message) => AccessKind::AgentMessage {
+                subagent_id: message.subagent_id.clone(),
+            },
             ToolInput::WebSearch(ws) => AccessKind::WebSearch(ws.query.clone()),
             ToolInput::SearchReplace(search_replace) => {
                 AccessKind::Edit(search_replace.file_path.to_string())
@@ -280,11 +357,48 @@ impl From<&xai_grok_tools::types::ToolInput> for AccessKind {
                 input: u.tool_input.clone(),
             },
             ToolInput::WebFetch(wf) => AccessKind::WebFetch(wf.url.clone()),
-            ToolInput::Dynamic(_) => AccessKind::Read(None),
+            ToolInput::Dynamic(value) => access_kind_from_dynamic(value),
             #[allow(unreachable_patterns)]
             _ => AccessKind::Read(None),
         }
     }
+}
+fn dynamic_string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let object = value.as_object()?;
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+}
+fn dynamic_has_field(value: &serde_json::Value, keys: &[&str]) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| keys.iter().any(|key| object.contains_key(*key)))
+}
+fn access_kind_from_dynamic(value: &serde_json::Value) -> AccessKind {
+    if let Some(path) = dynamic_string_field(value, &["filePath", "file_path", "path"]) {
+        let is_mutation = dynamic_has_field(
+            value,
+            &[
+                "oldString",
+                "old_string",
+                "newString",
+                "new_string",
+                "content",
+                "edits",
+                "replaceAll",
+                "replace_all",
+            ],
+        );
+        return if is_mutation {
+            AccessKind::Edit(path)
+        } else {
+            AccessKind::Read(Some(path))
+        };
+    }
+    if let Some(command) = dynamic_string_field(value, &["command"]) {
+        return AccessKind::Bash(command);
+    }
+    AccessKind::Read(None)
 }
 /// Permission policy configuration (duplicated from util/config.rs for Phase 1 move independence; identical).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -294,12 +408,20 @@ pub struct PermissionConfig {
     /// What to do when no rule or pre-decision resolves a tool call.
     #[serde(default)]
     pub prompt_policy: PromptPolicy,
+    /// Whether any settings layer explicitly set `permissions.defaultMode`.
+    /// `prompt_policy == Ask` alone cannot distinguish "nothing configured"
+    /// from an explicit `default` / `plan` / `acceptEdits` / invalid-value
+    /// fail-safe (all of which project to `Ask`), so mode-sensitive callers
+    /// (`apply_permission_mode_hint`) key on this provenance bit instead.
+    #[serde(default)]
+    pub default_mode_configured: bool,
 }
 impl PermissionConfig {
     pub fn new(rules: Vec<PermissionRule>) -> Self {
         Self {
             rules,
             prompt_policy: PromptPolicy::Ask,
+            default_mode_configured: false,
         }
     }
 }
@@ -315,6 +437,13 @@ pub enum PromptPolicy {
     /// Use the auto-mode classifier (`permissions.defaultMode: "auto"`).
     /// Seeded into the permission manager's auto flag at session start.
     Auto,
+    /// Resolve as allow without prompting. Not reachable from settings
+    /// `defaultMode`; set only at spawn time for headless sessions whose
+    /// client pre-declared an allow answer
+    /// (`startupHints.permissionMode: "alwaysAllow"`). Hard deny rules and
+    /// pre-prompt rejections still apply — this only replaces the prompt
+    /// itself, exactly like a connected client answering allow.
+    Allow,
 }
 /// A single permission rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,6 +474,7 @@ pub enum RuleAction {
 /// Tool filter for permission rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ToolFilter {
     #[default]
     Any,
@@ -355,6 +485,8 @@ pub enum ToolFilter {
     Mcp,
     WebFetch,
     WebSearch,
+    #[serde(rename = "agent_message", alias = "agentmessage")]
+    AgentMessage,
 }
 /// Where a requirement/permission was loaded from (duplicated for claude_compat).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,6 +545,16 @@ pub struct Sourced<T> {
 mod tests {
     use super::*;
     #[test]
+    fn agent_message_tool_filter_serde_is_dedicated_and_unknown_is_rejected() {
+        let filter: ToolFilter = serde_json::from_str(r#""agent_message""#).unwrap();
+        assert_eq!(filter, ToolFilter::AgentMessage);
+        assert_eq!(
+            serde_json::to_string(&filter).unwrap(),
+            r#""agent_message""#
+        );
+        assert!(serde_json::from_str::<ToolFilter>(r#""future_tool""#).is_err());
+    }
+    #[test]
     fn permission_event_subagent_fields_default_to_none() {
         let json = r#"{
             "tool_id": "tc1",
@@ -430,8 +572,41 @@ mod tests {
         assert!(event.subagent_description.is_none());
         assert!(event.permission_mode.is_none());
         assert!(event.decision_reason.is_none());
+        assert!(event.classifier_source.is_none());
+        assert!(event.classifier_latency_ms.is_none());
+        assert!(event.auto_denials_consecutive.is_none());
+        assert!(event.auto_denials_total.is_none());
         assert!(event.wait_ms.is_none());
         assert!(event.queue_depth.is_none());
+        assert!(event.security_findings.is_none());
+        assert!(event.classifier_verdict.is_none());
+    }
+    #[test]
+    fn permission_event_findings_none_vs_some_empty_are_distinct() {
+        let base = r#"{
+            "tool_id": "tc1",
+            "tool_name": "bash",
+            "access_kind": "bash",
+            "yolo_mode": false,
+            "auto_approved": false,
+            "user_prompted": true,
+            "decision": "allow",
+            "timestamp": "2026-03-24T00:00:00Z",
+            "security_findings": [],
+            "classifier_verdict": "block"
+        }"#;
+        let event: PermissionEvent = serde_json::from_str(base).unwrap();
+        assert_eq!(event.security_findings.as_deref(), Some(&[][..]));
+        assert_eq!(event.classifier_verdict.as_deref(), Some("block"));
+        let with_tokens: PermissionEvent = serde_json::from_str(&base.replace(
+            "\"security_findings\": []",
+            "\"security_findings\": [\"opaque_shell\"]",
+        ))
+        .unwrap();
+        assert_eq!(
+            with_tokens.security_findings.as_deref(),
+            Some(&["opaque_shell".to_owned()][..])
+        );
     }
     #[test]
     fn permission_event_with_subagent_attribution() {
@@ -452,8 +627,15 @@ mod tests {
             subagent_description: Some("Find endpoints".into()),
             permission_mode: Some("ask".into()),
             decision_reason: Some("needs_user".into()),
+            classifier_source: Some("llm".into()),
+            classifier_latency_ms: Some(42),
+            auto_denials_consecutive: Some(2),
+            auto_denials_total: Some(5),
             wait_ms: Some(1234),
             queue_depth: Some(3),
+            security_findings: Some(vec!["opaque_shell".into()]),
+            classifier_verdict: Some("block".into()),
+            remember_tool_approvals: Some(true),
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["subagent_session_id"], "child-1");
@@ -461,8 +643,15 @@ mod tests {
         assert_eq!(json["subagent_description"], "Find endpoints");
         assert_eq!(json["permission_mode"], "ask");
         assert_eq!(json["decision_reason"], "needs_user");
+        assert_eq!(json["classifier_source"], "llm");
+        assert_eq!(json["classifier_latency_ms"], 42);
+        assert_eq!(json["auto_denials_consecutive"], 2);
+        assert_eq!(json["auto_denials_total"], 5);
         assert_eq!(json["wait_ms"], 1234);
         assert_eq!(json["queue_depth"], 3);
+        assert_eq!(json["security_findings"][0], "opaque_shell");
+        assert_eq!(json["classifier_verdict"], "block");
+        assert_eq!(json["remember_tool_approvals"], true);
     }
     #[test]
     fn permission_event_skips_none_optional_fields() {
@@ -483,16 +672,30 @@ mod tests {
             subagent_description: None,
             permission_mode: None,
             decision_reason: None,
+            classifier_source: None,
+            classifier_latency_ms: None,
+            auto_denials_consecutive: None,
+            auto_denials_total: None,
             wait_ms: None,
             queue_depth: None,
+            security_findings: None,
+            classifier_verdict: None,
+            remember_tool_approvals: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(!json.contains("subagent_session_id"));
         assert!(!json.contains("subagent_type"));
         assert!(!json.contains("permission_mode"));
         assert!(!json.contains("decision_reason"));
+        assert!(!json.contains("classifier_source"));
+        assert!(!json.contains("classifier_latency_ms"));
+        assert!(!json.contains("auto_denials_consecutive"));
+        assert!(!json.contains("auto_denials_total"));
         assert!(!json.contains("wait_ms"));
         assert!(!json.contains("queue_depth"));
+        assert!(!json.contains("security_findings"));
+        assert!(!json.contains("classifier_verdict"));
+        assert!(!json.contains("remember_tool_approvals"));
     }
     #[test]
     fn hashline_edit_maps_to_edit_access() {
@@ -525,6 +728,21 @@ mod tests {
         );
     }
     #[test]
+    fn active_agent_message_maps_to_dedicated_access_without_text() {
+        use xai_grok_tools::implementations::grok_build::send_subagent_message::SendSubagentMessageInput;
+        use xai_grok_tools::types::ToolInput;
+        let text = "private follow-up";
+        let access = AccessKind::from(&ToolInput::SendSubagentMessage(SendSubagentMessageInput {
+            subagent_id: "sub-1".into(),
+            text: text.into(),
+        }));
+        let AccessKind::AgentMessage { subagent_id } = access else {
+            panic!("active agent messages must use dedicated access")
+        };
+        assert_eq!(subagent_id, "sub-1");
+        assert!(!subagent_id.contains(text));
+    }
+    #[test]
     fn use_tool_maps_to_mcp_tool_access() {
         use xai_grok_tools::implementations::use_tool::UseToolInput;
         use xai_grok_tools::types::ToolInput;
@@ -534,8 +752,11 @@ mod tests {
         });
         let access = AccessKind::from(&input);
         assert!(
-            matches!(access, AccessKind::MCPTool { ref name, ref input } if name ==
-            "linear__save_issue" && input["title"] == "test"),
+            matches!(
+                access,
+                AccessKind::MCPTool { ref name, ref input }
+                    if name == "linear__save_issue" && input["title"] == "test"
+            ),
             "UseTool should produce AccessKind::MCPTool carrying the inner tool name and args, got {access:?}"
         );
     }
@@ -547,12 +768,11 @@ mod tests {
             command: "tail -f /var/log/syslog".into(),
             description: "watch syslog".into(),
             timeout_ms: None,
-            persistent: None,
+            persistent: false,
         });
         let access = AccessKind::from(&input);
         assert!(
-            matches!(access, AccessKind::Bash(ref cmd) if cmd ==
-            "tail -f /var/log/syslog"),
+            matches!(access, AccessKind::Bash(ref cmd) if cmd == "tail -f /var/log/syslog"),
             "Monitor runs shell and must map to AccessKind::Bash (not Read), got {access:?}"
         );
     }
@@ -581,8 +801,7 @@ mod tests {
         });
         let access = AccessKind::from(&input);
         assert!(
-            matches!(access, AccessKind::WebFetch(ref u) if u ==
-            "https://custom.example.com/api"),
+            matches!(access, AccessKind::WebFetch(ref u) if u == "https://custom.example.com/api"),
             "WebFetch should produce AccessKind::WebFetch with the URL, got {access:?}"
         );
     }
@@ -626,6 +845,61 @@ mod tests {
             matches!(access, AccessKind::Edit(ref p) if p == "/tmp/secret.txt"),
             "Write should produce AccessKind::Edit with the file path, got {access:?}"
         );
+    }
+    #[test]
+    fn write_scoped_and_dynamic_inputs_map_to_edit_not_read() {
+        use xai_grok_tools::implementations::opencode::edit::EditInput;
+        use xai_grok_tools::types::ToolInput;
+        use xai_tool_types::TaskToolInput;
+        let edit = ToolInput::from(EditInput {
+            file_path: "/tmp/denied.txt".into(),
+            old_string: "ORIGINAL".into(),
+            new_string: "BYPASS".into(),
+            replace_all: false,
+        });
+        assert!(matches!(
+            &edit,
+            ToolInput::SearchReplace(sr) if sr.file_path == "/tmp/denied.txt"
+        ));
+        assert!(matches!(
+            AccessKind::from(&edit),
+            AccessKind::Edit(p) if p == "/tmp/denied.txt"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Task(TaskToolInput {
+                prompt: "edit config.toml".into(),
+                description: "spawn".into(),
+                subagent_type: "general-purpose".into(),
+                run_in_background: false,
+                capability_mode: None,
+                isolation: None,
+                resume_from: None,
+                cwd: None,
+                model: None,
+                task_id: None,
+            })),
+            AccessKind::Edit(p) if p == "task:general-purpose"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Dynamic(serde_json::json!({
+                "filePath": "/tmp/denied.txt",
+                "oldString": "a",
+                "newString": "b",
+            }))),
+            AccessKind::Edit(p) if p == "/tmp/denied.txt"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Dynamic(serde_json::json!({
+                "filePath": "src/main.rs"
+            }))),
+            AccessKind::Read(Some(p)) if p == "src/main.rs"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Dynamic(serde_json::json!({
+                "command": "rm -rf /"
+            }))),
+            AccessKind::Bash(c) if c == "rm -rf /"
+        ));
     }
     #[test]
     fn client_type_deserializes_grok_shell_as_generic() {

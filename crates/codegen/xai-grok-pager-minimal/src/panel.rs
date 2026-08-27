@@ -193,7 +193,12 @@ fn resume_body_rows(agent: &AgentView, width: u16) -> u16 {
         state,
         Some(current_repo.as_str()),
     );
-    measure_entries(&picker_entries)
+    // Reserve a row for the pinned hidden-external hint when shown.
+    let hint_row = u16::from(
+        !agent.app_chat_mode
+            && minimal_api::hidden_external_hint(entries.as_deref(), *source_filter).is_some(),
+    );
+    measure_entries(&picker_entries).saturating_add(hint_row)
 }
 
 fn render_resume(
@@ -203,6 +208,7 @@ fn render_resume(
     theme: &Theme,
 ) -> Option<(u16, u16)> {
     let cwd = agent.session.cwd.to_string_lossy().to_string();
+    let chat_mode = agent.app_chat_mode;
     let Some(ActiveModal::SessionPicker {
         entries,
         state,
@@ -212,7 +218,7 @@ fn render_resume(
     else {
         return None;
     };
-    let (title_row, search_row, divider_row, list_area, footer_row) = chrome_layout(area);
+    let (title_row, search_row, divider_row, mut list_area, footer_row) = chrome_layout(area);
 
     let entries_data = entries.as_deref().unwrap_or(&[]);
     let content_width = area.width.saturating_sub(2);
@@ -238,6 +244,9 @@ fn render_resume(
         state,
         Some(current_repo.as_str()),
     );
+    let hidden_hint = (!chat_mode)
+        .then(|| minimal_api::hidden_external_hint(entries.as_deref(), *source_filter))
+        .flatten();
 
     render_title(buf, title_row, theme, "Resume session");
     // Focus-aware search bar (cursor only when search is focused).
@@ -255,6 +264,21 @@ fn render_resume(
         None,
     );
     render_divider(buf, divider_row, theme);
+
+    // Pinned above the list so it stays visible regardless of list scroll.
+    if let Some(hint) = hidden_hint.as_deref() {
+        render_dim_line(
+            buf,
+            Rect {
+                height: 1,
+                ..list_area
+            },
+            theme,
+            hint,
+        );
+        list_area.y += 1;
+        list_area.height = list_area.height.saturating_sub(1);
+    }
 
     let nsc = vec![false; picker_entries.len()];
     let hit = picker::render_picker_content(
@@ -493,14 +517,22 @@ fn render_mcps(
 
 // ─────────────────────────────── helpers ────────────────────────────────────
 
-/// Sum the display height of grouped picker entries: a header is one row; a row
-/// is its label line plus its collapsed summary lines (what the picker draws
-/// when the row is not expanded).
+/// Sum the display height of grouped picker entries: a header is one row (plus
+/// the blank spacer `render_picker_content` draws before non-first headers); a
+/// row is its label line plus its collapsed summary lines (what the picker
+/// draws when the row is not expanded).
 fn measure_entries(entries: &[PickerEntry<'_>]) -> u16 {
     entries
         .iter()
-        .map(|e| match e {
-            PickerEntry::Header { .. } => 1u16,
+        .enumerate()
+        .map(|(idx, e)| match e {
+            PickerEntry::Header { .. } => {
+                if idx == 0 {
+                    1u16
+                } else {
+                    2u16
+                }
+            }
             PickerEntry::Row(r) => {
                 if r.expanded {
                     1u16.saturating_add(r.description_lines.len() as u16)
@@ -571,6 +603,9 @@ mod tests {
             branch: None,
             repo_name: "repo".into(),
             worktree_label: None,
+            last_turn_summary: None,
+            last_recap: None,
+            session_kind: None,
             card_detail: None,
         }
     }
@@ -587,6 +622,8 @@ mod tests {
             content_results: None,
             content_loading: false,
             deep_search_seq: 0,
+            generation: 0,
+            detail_seq: 0,
             source_filter: xai_grok_pager::views::session_picker::SourceFilter::default(),
             pending_delete: None,
             entries_query: None,

@@ -36,6 +36,93 @@
         assert!(app.shared_prompt_queue("sess-1").is_none());
     }
 
+    #[test]
+    fn child_queue_changed_routes_parent_message_to_child_and_clears_it() {
+        let mut app = make_app_with_agent("sess-parent");
+        let child_sid = "sess-child";
+        let notification =
+            |session_id: &str, entries: &[(&str, u64, &str)], running_prompt_id: Option<&str>| {
+                let (tx, _rx) = tokio::sync::oneshot::channel();
+                AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+                    request: queue_changed_versioned(session_id, entries, running_prompt_id),
+                    response_tx: tx,
+                })
+            };
+
+        assert!(handle(
+            notification("sess-parent", &[("root-prompt", 1, "prompt")], None),
+            &mut app,
+        ));
+        assert!(handle(
+            make_ext_session_notification(
+                "sess-parent",
+                test_subagent_spawned("sess-parent", child_sid),
+            ),
+            &mut app,
+        ));
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .active_subagent = Some(child_sid.to_string());
+
+        assert!(handle(
+            notification(
+                child_sid,
+                &[("parent-message-1", 1, "parent_agent_message")],
+                Some("child-running"),
+            ),
+            &mut app,
+        ));
+
+        let parent = &app.agents[&AgentId(0)];
+        assert_eq!(
+            parent
+                .shared_queue
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root-prompt"],
+            "the root queue must stay unchanged",
+        );
+        assert!(
+            parent.session.current_prompt_id.is_none(),
+            "a child running id must not trigger root adoption",
+        );
+        assert!(app.pending_running_adoptions.is_empty());
+        assert!(app.pending_effects.is_empty());
+        let child = &parent.subagent_views[child_sid];
+        assert_eq!(
+            child
+                .shared_queue
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.kind.as_str(), entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(
+                "parent-message-1",
+                "parent_agent_message",
+                "text parent-message-1",
+            )],
+        );
+        assert_eq!(child.queue.entry_ids().len(), 1);
+        assert!(child.queue.is_visible());
+
+        assert!(handle(notification(child_sid, &[], None), &mut app));
+        let parent = &app.agents[&AgentId(0)];
+        assert_eq!(
+            parent
+                .shared_queue
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root-prompt"],
+            "clearing the child must not affect root",
+        );
+        let child = &parent.subagent_views[child_sid];
+        assert!(child.shared_queue.is_empty());
+        assert!(child.queue.entry_ids().is_empty());
+        assert!(!child.queue.is_visible());
+    }
+
     /// When a server-origin row being edited disappears from a later
     /// broadcast (drained / removed by another client), the queue handler
     /// exits `EditingQueued` so the composer isn't stranded.
@@ -328,6 +415,9 @@
             session_id: "sess-1".to_string(),
             entries: Vec::new(),
             running_prompt_id: Some("prompt-running".to_string()),
+            running_text: None,
+            running_kind: None,
+            running_combined_texts: None,
         };
         let raw = serde_json::value::to_raw_value(&shell_payload).unwrap();
         let json_str = raw.get().to_string();
@@ -410,6 +500,59 @@
         );
         // The running item left the shared queue.
         assert!(app.shared_prompt_queue("sess-1").is_none());
+    }
+
+    #[test]
+    fn running_combined_texts_paints_one_bubble_per_segment() {
+        let mut app = make_app_with_agent("sess-1");
+        let id = AgentId(0);
+        let before = app.agents[&id].scrollback.len();
+        assert!(handle_queue_changed(
+            &queue_changed_running_ex(
+                "sess-1",
+                &[],
+                Some("p-combo"),
+                Some("first\n\nsecond"),
+                Some("prompt"),
+                Some(&["first", "second"]),
+            ),
+            &mut app,
+        ));
+        let agent = app.agents.get(&id).unwrap();
+        assert_eq!(agent.session.current_prompt_id.as_deref(), Some("p-combo"));
+        assert_eq!(agent.scrollback.len(), before + 2);
+        let texts: Vec<_> = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i))
+            .filter_map(|e| match &e.block {
+                RenderBlock::UserPrompt(ub) => Some(ub.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["first", "second"]);
+    }
+
+    #[test]
+    fn running_text_without_segments_paints_single_bubble() {
+        let mut app = make_app_with_agent("sess-1");
+        let id = AgentId(0);
+        let before = app.agents[&id].scrollback.len();
+        assert!(handle_queue_changed(
+            &queue_changed_running_ex(
+                "sess-1",
+                &[],
+                Some("p-join"),
+                Some("first\n\nsecond"),
+                Some("prompt"),
+                None,
+            ),
+            &mut app,
+        ));
+        let agent = app.agents.get(&id).unwrap();
+        assert_eq!(agent.scrollback.len(), before + 1);
+        match &agent.scrollback.entry(before).unwrap().block {
+            RenderBlock::UserPrompt(ub) => assert_eq!(ub.text, "first\n\nsecond"),
+            other => panic!("expected user prompt, got {other:?}"),
+        }
     }
 
     /// Regression: when the shell promotes
@@ -986,6 +1129,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1111,6 +1255,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("task-completed-abc-123".to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1151,6 +1296,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some(pid.to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1188,6 +1334,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1221,6 +1368,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: None,
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1430,8 +1578,12 @@
                 kind: "bash".to_string(),
                 text: "ls -la".to_string(),
                 position: 0,
+                combined_texts: None,
             }],
             running_prompt_id: None,
+            running_text: None,
+            running_kind: None,
+            running_combined_texts: None,
         };
         let json = serde_json::to_string(&shell).unwrap();
         let mirror: crate::app::prompt_queue::QueueChanged = serde_json::from_str(&json).unwrap();
@@ -1679,6 +1831,7 @@
             crate::app::acp_handler::PendingRunningAdoption {
                 prompt_id: "p1".to_string(),
                 text: Some("first".to_string()),
+                combined_texts: None,
                 kind: "prompt".to_string(),
                 turn_ended: false,
             },
@@ -1929,13 +2082,28 @@
         agent.last_seen_event_id = Some("sess-a-7".into());
         agent.last_applied_event_seq = Some(7);
         agent.last_applied_xai_event_seq = Some(8);
+        agent.deferred_subagent_finishes.insert(
+            "child-stale".into(),
+            crate::app::agent_view::DeferredSubagentFinish {
+                notification: xai_grok_shell::extensions::notification::SessionNotification {
+                    session_id: acp::SessionId::new("sess-a"),
+                    update: test_subagent_finished("child-stale"),
+                    meta: None,
+                },
+                inserted_at: std::time::Instant::now(),
+            },
+        );
 
+        let epoch = agent.session_binding_epoch;
         agent.bind_session_id(acp::SessionId::new("sess-a"));
+        assert_eq!(agent.session_binding_epoch, epoch);
         assert_eq!(agent.last_seen_event_id.as_deref(), Some("sess-a-7"));
         assert_eq!(agent.last_applied_event_seq, Some(7));
         assert_eq!(agent.last_applied_xai_event_seq, Some(8));
+        assert_eq!(agent.deferred_subagent_finishes.len(), 1);
 
         agent.bind_session_id(acp::SessionId::new("sess-b"));
+        assert_eq!(agent.session_binding_epoch, epoch.wrapping_add(1));
         assert_eq!(
             agent.session.session_id.as_ref().map(|s| s.0.as_ref()),
             Some("sess-b")
@@ -1946,6 +2114,22 @@
         );
         assert!(agent.last_applied_event_seq.is_none());
         assert!(agent.last_applied_xai_event_seq.is_none());
+        assert!(
+            agent.deferred_subagent_finishes.is_empty(),
+            "deferred finishes are meaningless against another session"
+        );
+    }
+
+    #[test]
+    fn session_binding_epoch_counts_bind_and_unbind_transitions() {
+        let mut agent = make_agent(None);
+        assert_eq!(agent.session_binding_epoch, 0);
+        agent.bind_session_id(acp::SessionId::new("a"));
+        assert_eq!(agent.session_binding_epoch, 1);
+        agent.unbind_session_id();
+        assert_eq!(agent.session_binding_epoch, 2);
+        agent.bind_session_id(acp::SessionId::new("a"));
+        assert_eq!(agent.session_binding_epoch, 3);
     }
 
     #[test]
@@ -2326,7 +2510,10 @@
         let agent = app.agents.get(&AgentId(0)).unwrap();
         match last_session_event(&agent.scrollback) {
             Some(SessionEvent::TurnFailed { error, .. }) => {
-                assert_eq!(error, "boom", "agentResult must propagate into the marker")
+                assert_eq!(
+                    error, "Request failed: boom. Try sending again.",
+                    "agentResult must propagate into the formatted marker"
+                )
             }
             other => panic!("expected TurnFailed marker, got {other:?}"),
         }
@@ -2450,6 +2637,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );

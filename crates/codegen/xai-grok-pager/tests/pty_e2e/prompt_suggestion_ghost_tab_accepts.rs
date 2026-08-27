@@ -22,31 +22,38 @@ const ACCEPT_HINT: &str = "accept suggestion";
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn prompt_suggestion_ghost_tab_accepts() {
-    // The suggestion model (`grok-build-0.1`, the shell's built-in default)
+    // The suggestion model (`grok-4.6`, the shell's built-in default)
     // must be in the mock catalog: the shell catalog-guards the effective
     // suggestion model and *skips the request entirely* when it is not
-    // sampleable (`prompt_suggest::effective_suggest_model`), exactly as it
-    // does for OAuth users whose catalogs exclude it. Listing it exercises
-    // the real guarded path end-to-end: pager hints the model from its
-    // catalog → shell guard passes → request fires → ghost renders.
+    // sampleable (`prompt_suggest::effective_suggest_model`). Listing it
+    // exercises the real guarded path end-to-end: pager hints the model from
+    // its catalog → shell guard passes → request fires → ghost renders.
     // `test-model` stays first so it remains the session's default model.
     let content = ContentController::start_with_models(vec![
         MockModel::new("test-model"),
-        MockModel::new("grok-build-0.1"),
+        MockModel::new("grok-4.6"),
     ])
     .await
     .expect("start content");
     content.set_response(SUGGESTION);
 
-    // env_for_pager disables the feature for the suite; re-enable it here.
-    let mut env = content.env_for_pager();
-    env.retain(|(k, _)| k != "GROK_PROMPT_SUGGESTIONS");
-    env.push(("GROK_PROMPT_SUGGESTIONS".into(), "true".into()));
-    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    // The sandbox baseline disables the feature for the suite; re-enable it here.
+    let overrides = [("GROK_PROMPT_SUGGESTIONS".to_owned(), "true".to_owned())];
+    let env_refs: Vec<(&str, &str)> = overrides
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
 
     let binary = pager_binary().expect("resolve pager binary");
-    let mut harness =
-        PtyHarness::new(&binary, DEFAULT_ROWS, DEFAULT_COLS, &[], &env_refs).expect("spawn pager");
+    let mut harness = PtyHarness::spawn_with_content_env(
+        &binary,
+        DEFAULT_ROWS,
+        DEFAULT_COLS,
+        &content,
+        &[],
+        &env_refs,
+    )
+    .expect("spawn pager");
 
     harness
         .wait_for_text(WELCOME_SCREEN_SENTINEL, WELCOME_TIMEOUT)

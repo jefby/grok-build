@@ -9,7 +9,7 @@
 //!
 //! ## Precedence (canonical — see [`decide`])
 //! 1. Feature flag OFF  → trusted (no gating; preserves prior behavior).
-//! 2. Store (self/ancestor recorded trusted) → trusted. An explicit `--trust`
+//! 2. Store (this workspace recorded trusted) → trusted. An explicit `--trust`
 //!    grant is persisted to the store up front (see [`grant_folder_trust`]), so
 //!    it is honored here.
 //! 3. Key unrecordable (an over-broad root — the user's own `$HOME` / filesystem
@@ -199,9 +199,8 @@ pub fn grant_folder_trust(cwd: &Path) {
 /// it had been trusted. The in-process `DECISIONS` cache downgrade is the shell
 /// wrapper's job (the cache lives there).
 ///
-/// Writing a store deny for a never-trusted folder would record a most-specific
-/// child DENY that poisons a future ancestor `set_trusted` cascade — so that
-/// write stays gated. Symmetric with [`grant_folder_trust`].
+/// A never-trusted folder stays undecided: do not persist a decision the user
+/// did not make. Symmetric with [`grant_folder_trust`].
 pub fn revoke_folder_trust_store(cwd: &Path) -> bool {
     // Local/dev builds never wrote the store, so there is nothing to revoke.
     if folder_trust_inert() {
@@ -210,9 +209,6 @@ pub fn revoke_folder_trust_store(cwd: &Path) -> bool {
     let key = workspace_key(cwd);
     let mut store = TrustStore::load();
     let was_trusted = store.is_trusted(&key);
-    // Persist an explicit deny ONLY for an actually-trusted folder: writing one
-    // for a never-trusted folder would record a most-specific child DENY that
-    // overrides a future ancestor `set_trusted` grant (cascade poisoning).
     if was_trusted && let Err(e) = store.set_untrusted(&key) {
         tracing::warn!(
             path = %key.display(),
@@ -245,14 +241,42 @@ pub fn repo_configs_present(cwd: &Path) -> bool {
 }
 
 /// Display-only: which repo-local trust-sensitive config KINDS are present for
-/// `cwd` (`mcp`, `plugins`, `lsp`, `envrc`, `claude`, `hooks`, `agents`, `roles`,
-/// `personas`), deduped in cheap→expensive marker order. Single source with
-/// [`repo_configs_present`] (which is `!repo_config_kinds(cwd).is_empty()`), so a
-/// folder that the gate fired on always has a non-empty, accurate kind list — no
-/// `[plugins].paths` / `.claude` / `.grok/agents` / subdir-launch gaps. NOT
-/// itself the trust gate.
+/// `cwd` (`mcp`, `plugins`, `permission`, `lsp`, `envrc`, `claude`, `hooks`,
+/// `agents`, `roles`, `personas`, `workflows`), deduped in cheap→expensive
+/// marker order. Single source with [`repo_configs_present`] (which is
+/// `!repo_config_kinds(cwd).is_empty()`), so a folder that the gate fired on
+/// always has a non-empty, accurate kind list — no `[plugins].paths` /
+/// `[permission]` / `.claude` / `.grok/agents` / subdir-launch gaps. NOT itself
+/// the trust gate.
 pub fn repo_config_kinds(cwd: &Path) -> Vec<&'static str> {
     collect_repo_config_kinds(cwd, false)
+}
+
+/// Whether a project `.grok/config.toml` `[permission]` value would contribute
+/// rules to the permission resolver. Mirrors the compact/verbose shapes that
+/// `permission::resolution` loads: non-empty `allow`/`deny`/`ask` string arrays,
+/// or a non-empty verbose `rules` array. Empty arrays / empty tables do not gate
+/// (same as empty `[mcp_servers]` / empty `[plugins].paths`).
+fn config_toml_permission_contributes(permission_value: &TomlValue) -> bool {
+    let Some(table) = permission_value.as_table() else {
+        // Non-table `[permission]` fails config load elsewhere; treat as a
+        // marker so a malicious non-table still trips the gate rather than
+        // resolving trusted.
+        return true;
+    };
+    for key in ["deny", "allow", "ask"] {
+        if table
+            .get(key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+        {
+            return true;
+        }
+    }
+    table
+        .get("rules")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
 }
 
 fn path_present_or_uncertain(path: &Path) -> bool {
@@ -302,11 +326,13 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     if !crate::project_config::find_mcp_json_files_in(&chain.dirs).is_empty() {
         hit!("mcp");
     }
-    // Project `.grok/config.toml` declaring repo-controlled code-exec: a
-    // non-empty `[mcp_servers]` table OR a non-empty `[plugins].paths` array.
-    // `[plugins].paths` loads as auto-trusted ConfigPath plugins, so a clone
-    // whose ONLY repo-local config is `[plugins].paths` must still be gated
-    // (else it resolves Trusted and the paths merge runs ungated => RCE).
+    // Project `.grok/config.toml` declaring repo-controlled code-exec or
+    // permission policy: a non-empty `[mcp_servers]` table, a non-empty
+    // `[plugins].paths` array, OR a contributing `[permission]` section.
+    // `[plugins].paths` loads as auto-trusted ConfigPath plugins; `[permission]`
+    // allow/deny/ask rules auto-approve or block tools — a clone whose ONLY
+    // repo-local config is either must still be gated (else it resolves Trusted
+    // and the loader runs ungated).
     for path in crate::project_config::find_project_configs_in(&chain.dirs) {
         let Ok(root) = xai_grok_config::load_config_file(&path) else {
             continue;
@@ -320,11 +346,17 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
             .and_then(|v| v.get("paths"))
             .and_then(|v| v.as_array())
             .is_some_and(|a| !a.is_empty());
+        let has_permission = root
+            .get("permission")
+            .is_some_and(config_toml_permission_contributes);
         if has_mcp_servers {
             hit!("mcp");
         }
         if has_plugin_paths {
             hit!("plugins");
+        }
+        if has_permission {
+            hit!("permission");
         }
     }
     // Project `.grok/lsp.json`.
@@ -332,9 +364,8 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
         hit!("lsp");
     }
     // Project `.cursor/mcp.json` — vendor MCP loading is default-on and tagged
-    // `Project`, so a repo shipping ONLY this file must still be gated. (File
-    // presence is enough; if the `.cursor` compat flag is off the servers won't
-    // spawn and gating is a harmless no-op.)
+    // `Project`, so a repo shipping ONLY this file must still be gated (file
+    // presence is enough).
     if cwd.join(".cursor").join("mcp.json").is_file() {
         hit!("mcp");
     }
@@ -392,6 +423,9 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     }
     if directory_present_or_uncertain(&grok.join("personas")) {
         hit!("personas");
+    }
+    if directory_present_or_uncertain(&hook_root.join(".grok").join("workflows")) {
+        hit!("workflows");
     }
     // `~/.claude.json` `projects.<cwd>.mcpServers`.
     if claude_project_mcp_present(cwd) {
@@ -671,6 +705,16 @@ mod tests {
     }
 
     #[test]
+    fn repo_configs_present_detects_project_workflows_from_subdir() {
+        let tmp = repo_tmp();
+        std::fs::create_dir_all(tmp.path().join(".grok").join("workflows")).unwrap();
+        let subdir = tmp.path().join("crates").join("inner");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert!(repo_configs_present(&subdir));
+        assert!(repo_config_kinds(&subdir).contains(&"workflows"));
+    }
+
+    #[test]
     fn repo_configs_present_detects_claude_settings_from_subdir() {
         // A `.claude/settings.json` `env` in a SUBDIR (no other repo config),
         // launched from that subdir, must be detected: the env loader walks
@@ -779,6 +823,48 @@ mod tests {
         let grok = tmp.path().join(".grok");
         std::fs::create_dir_all(&grok).unwrap();
         std::fs::write(grok.join("config.toml"), "[plugins]\npaths = []\n").unwrap();
+        assert!(!repo_configs_present(tmp.path()));
+    }
+
+    #[test]
+    fn repo_configs_present_detects_grok_config_permission() {
+        // A repo whose ONLY repo-local config is a contributing `[permission]`
+        // section (no MCP/plugins/hooks) must still be gated: those allow rules
+        // auto-approve tool calls, so an ungated clone loads the attacker's
+        // policy. Also covers subdir launch (cwd→git-root walk).
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(
+            grok.join("config.toml"),
+            "[permission]\nallow = [\"Bash(*)\"]\n",
+        )
+        .unwrap();
+        assert!(repo_configs_present(tmp.path()));
+        assert!(
+            repo_config_kinds(tmp.path()).contains(&"permission"),
+            "permission-only repo must report the permission kind"
+        );
+        let subdir = tmp.path().join("crates").join("inner");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert!(
+            repo_configs_present(&subdir),
+            "permission-only config at git root must gate subdir launches"
+        );
+    }
+
+    #[test]
+    fn repo_configs_present_false_for_empty_permission() {
+        // Empty allow/deny/ask arrays contribute no rules, so they must not
+        // trip the gate (mirrors empty `[mcp_servers]` / empty `[plugins].paths`).
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(
+            grok.join("config.toml"),
+            "[permission]\nallow = []\ndeny = []\n",
+        )
+        .unwrap();
         assert!(!repo_configs_present(tmp.path()));
     }
 
@@ -1012,34 +1098,21 @@ mod tests {
 
     #[test]
     fn revoke_folder_trust_store_writes_no_deny_for_never_trusted_folder() {
-        // The cascade-poisoning guard: revoking a NEVER-trusted child returns
-        // false and writes NO explicit child deny, so a later ancestor grant still
-        // cascades to the child (a spurious child `set_untrusted` would win
-        // most-specific and break the cascade). This store half does NOT touch the
-        // `DECISIONS` cache — that downgrade is the shell wrapper's job.
-        // GROK_HOME-isolated so the grant writes to a temp store.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvVarGuard::set("GROK_HOME", home.path());
         let _sim = simulate_release_build();
-        // Distinct git roots so `workspace_key` keeps parent/child as separate
-        // keys (the child's own `.git` stops discovery at the child).
-        let parent = repo_tmp();
-        let child = parent.path().join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        git2::Repository::init(&child).unwrap();
+        let tmp = repo_tmp();
 
         assert!(
-            !revoke_folder_trust_store(&child),
+            !revoke_folder_trust_store(tmp.path()),
             "revoking a never-trusted folder must return false"
         );
 
-        // No child deny was written, so an ancestor grant still cascades down.
-        let mut store = TrustStore::load();
-        store.set_trusted(&workspace_key(parent.path())).unwrap();
+        let store = TrustStore::load();
         assert!(
-            TrustStore::load().is_trusted(&workspace_key(&child)),
-            "ancestor grant must cascade to a child revoked-while-untrusted (no poisoning deny)"
+            !store.has_decision(&workspace_key(tmp.path())),
+            "revoking a never-trusted folder must not record a child deny"
         );
     }
 

@@ -16,12 +16,17 @@ use std::path::{Path, PathBuf};
 /// 3. Staged files (if any)
 ///
 /// Total output is capped at ~1k characters.
+#[tracing::instrument(skip_all)]
 pub async fn git_status(working_directory: impl Into<PathBuf>) -> Result<String, FsError> {
     let working_directory = working_directory.into();
+    let permit = crate::git_odb::try_acquire_odb();
 
-    tokio::task::spawn_blocking(move || git_status_impl(&working_directory))
-        .await
-        .map_err(|e| FsError::Other(format!("git status task failed: {}", e)))?
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        git_status_impl(&working_directory)
+    })
+    .await
+    .map_err(|e| FsError::Other(format!("git status task failed: {e}")))?
 }
 
 /// Matches Node's default `execFile` `maxBuffer` (1 MiB). This cap is
@@ -64,24 +69,25 @@ fn collapse_status_spaces(s: &str) -> String {
     out
 }
 
-/// Short git status for the templated user message.
-///
-/// Runs `git status --short --branch` and returns its output with consecutive
-/// spaces collapsed via [`collapse_status_spaces`]: a leading `## <branch>`
-/// line followed by the file change list (or just `## <branch>` on a clean
-/// tree). This matches the body embedded in the `<git_status>` block
-/// byte-for-byte.
+#[tracing::instrument(skip_all)]
 pub async fn git_status_short(working_directory: impl Into<PathBuf>) -> Result<String, FsError> {
     let working_directory = working_directory.into();
+    let permit = crate::git_odb::try_acquire_odb();
 
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let output = xai_tty_utils::git_command()
-            .args(["status", "--short", "--branch"])
+            .args(["status", "--short", "--branch", "--untracked-files=normal"])
             .current_dir(&working_directory)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .output()
-            .map_err(|e| FsError::Other(format!("git status --short --branch failed: {}", e)))?;
+            .map_err(|e| {
+                FsError::Other(format!(
+                    "git status --short --branch --untracked-files=normal failed: {}",
+                    e
+                ))
+            })?;
 
         if !output.status.success() {
             return Err(FsError::Other(format!(
@@ -108,16 +114,13 @@ pub async fn git_status_short(working_directory: impl Into<PathBuf>) -> Result<S
     .map_err(|e| FsError::Other(format!("git status --short --branch task failed: {}", e)))?
 }
 
+#[tracing::instrument(skip_all)]
 fn git_status_impl(working_directory: &Path) -> Result<String, FsError> {
-    let _timer = /* instrumentation_timer */ () ; // dev macro; noop stub ("git_status.impl")
     let max_status_chars = 1000;
     let mut output = String::with_capacity(max_status_chars);
 
     // Get branch name
-    let branch_name = {
-        let _timer = /* instrumentation_timer */ () ; // dev macro; noop stub ("git_status.branch_info")
-        run_git(working_directory, &["rev-parse", "--abbrev-ref", "HEAD"])
-    };
+    let branch_name = { run_git(working_directory, &["rev-parse", "--abbrev-ref", "HEAD"]) };
 
     match &branch_name {
         Some(branch) if branch == "HEAD" => {
@@ -136,7 +139,6 @@ fn git_status_impl(working_directory: &Path) -> Result<String, FsError> {
 
     // Get upstream ahead/behind
     {
-        let _timer = (); // instrumentation_timer noop stub
         if let Some(upstream_name) = run_git(
             working_directory,
             &["rev-parse", "--abbrev-ref", "@{upstream}"],
@@ -177,7 +179,6 @@ fn git_status_impl(working_directory: &Path) -> Result<String, FsError> {
 
     // Get staged changes (index vs HEAD) — fast, no workdir scan
     let staged_output = {
-        let _timer = /* instrumentation_timer */ () ; // dev macro; noop stub ("git_status.staged")
         run_git(
             working_directory,
             &["diff", "--cached", "--name-status", "HEAD"],
@@ -238,6 +239,7 @@ fn git_status_impl(working_directory: &Path) -> Result<String, FsError> {
 /// Uses `--no-optional-locks` to avoid creating `index.lock` for stat-cache
 /// refreshes.  This function is called from background tasks (system prompt
 /// generation) and must never contend with foreground git operations.
+#[tracing::instrument(level = "debug", skip(cwd))]
 fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = xai_tty_utils::git_command()
         .args(args)

@@ -15,28 +15,28 @@ use crate::util::config::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT;
 
 /// Request to grab all the sessions from the current working directory
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct SessionListRequest {
+pub(crate) struct SessionListRequest {
     pub workspace_directory: PathBuf,
 }
 
 /// Request to grab all the sessions tagged by their working directory as well
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct AllSessionOverviewRequest {}
+pub(crate) struct AllSessionOverviewRequest {}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct SessionListResponse {
+pub(crate) struct SessionListResponse {
     pub session_summaries: Vec<Summary>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct AllSessionOverviewResponse {
+pub(crate) struct AllSessionOverviewResponse {
     pub all_sessions: BTreeMap<PathBuf, Vec<Summary>>,
 }
 
 // ── Compaction ──────────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct CompactConversationRequest {
+pub(crate) struct CompactConversationRequest {
     #[serde(alias = "sessionId")]
     pub session_id: String,
     #[serde(default, alias = "userContext")]
@@ -44,7 +44,7 @@ pub struct CompactConversationRequest {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct CompactConversationResponse {}
+pub(crate) struct CompactConversationResponse {}
 
 // ── Feedback ────────────────────────────────────────────────────────────
 
@@ -59,7 +59,7 @@ pub struct FeedbackRequest {
 
 /// Request to dismiss a feedback request (sent to the feedback backend).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct FeedbackRequestDismiss {
+pub(crate) struct FeedbackRequestDismiss {
     pub session_id: String,
     pub request_id: String,
 }
@@ -106,6 +106,9 @@ pub struct ClientFeedbackInput {
     /// Free-form feedback text
     #[serde(default)]
     pub feedback_text: Option<String>,
+
+    #[serde(default)]
+    pub images: Vec<prod_mc_cli_chat_proxy_types::feedback_types::FeedbackImage>,
 
     /// Feedback categories (e.g., ["accuracy", "speed", "helpfulness"])
     #[serde(default)]
@@ -169,8 +172,10 @@ impl ClientFeedbackInput {
     /// - `user_id`: Will be extracted from auth token by the backend
     ///
     /// Rating values are clamped to valid ranges based on rating_type.
-    pub(crate) fn to_submission(
-        &self,
+    /// `&mut self`: drains `images` into the submission instead of cloning
+    /// megabytes of base64; the input is not read for images afterwards.
+    pub(crate) fn take_submission(
+        &mut self,
         model_id: Option<String>,
         resolved_model_id: Option<String>,
         model_fingerprint: Option<String>,
@@ -205,6 +210,7 @@ impl ClientFeedbackInput {
             content,
         );
         s.turn_number = turn_number;
+        s.images = std::mem::take(&mut self.images);
         s.feedback_categories = self.feedback_categories.clone();
         s.model_id = model_id;
         s.resolved_model_id = resolved_model_id;
@@ -218,7 +224,7 @@ impl ClientFeedbackInput {
     }
 
     /// Check if this is a solicited feedback (response to a request)
-    pub fn is_solicited(&self) -> bool {
+    pub(crate) fn is_solicited(&self) -> bool {
         self.request_id.is_some()
     }
 
@@ -233,7 +239,7 @@ impl ClientFeedbackInput {
 /// Request to submit rollout survey responses about worktree improvements
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RolloutSurveyRequest {
+pub(crate) struct RolloutSurveyRequest {
     pub session_id: String,
     pub preferences: Vec<String>,
     pub feedback: String,
@@ -241,7 +247,7 @@ pub struct RolloutSurveyRequest {
 
 /// Response from submitting rollout survey
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct RolloutSurveyResponse {
+pub(crate) struct RolloutSurveyResponse {
     pub success: bool,
 }
 
@@ -262,7 +268,7 @@ pub struct Citation {
 /// Request to record an inline comment on a prompt turn.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CommentRequest {
+pub(crate) struct CommentRequest {
     pub session_id: String,
     /// 0-indexed prompt turn this comment is associated with
     pub prompt_index: u32,
@@ -273,7 +279,7 @@ pub struct CommentRequest {
 /// Response from recording a comment
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CommentResponse {
+pub(crate) struct CommentResponse {
     pub comment_id: String,
     pub recorded: bool,
 }
@@ -281,7 +287,7 @@ pub struct CommentResponse {
 /// Request to delete a previously recorded comment.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CommentDeleteRequest {
+pub(crate) struct CommentDeleteRequest {
     pub session_id: String,
     pub comment_id: String,
 }
@@ -289,7 +295,7 @@ pub struct CommentDeleteRequest {
 /// Response from deleting a comment
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CommentDeleteResponse {
+pub(crate) struct CommentDeleteResponse {
     pub comment_id: String,
     pub deleted: bool,
 }
@@ -325,7 +331,7 @@ pub struct RewindRequest {
     pub mode: RewindMode,
 }
 
-pub fn default_rewind_mode() -> RewindMode {
+pub(crate) fn default_rewind_mode() -> RewindMode {
     RewindMode::All
 }
 
@@ -421,6 +427,16 @@ impl TokenUsageCategory {
         }
     }
 
+    /// Row for the workflow listing. `text` is the canonical model-facing
+    /// catalog render.
+    pub fn workflows_listing(text: &str, workflow_count: usize) -> Self {
+        Self {
+            label: "Workflows".to_string(),
+            tokens: xai_token_estimation::estimate_tokens(text),
+            detail: Some(count_detail(workflow_count as u64, "workflow")),
+        }
+    }
+
     /// Row for the MCP server announcement. `text` is the full reminder
     /// body for the current server set.
     pub fn mcp_servers(text: &str, server_count: usize) -> Self {
@@ -428,6 +444,16 @@ impl TokenUsageCategory {
             label: "MCP servers".to_string(),
             tokens: xai_token_estimation::estimate_tokens(text),
             detail: Some(count_detail(server_count as u64, "server")),
+        }
+    }
+
+    /// Row for discovered AGENTS.md / project-instruction files. `text` is
+    /// the rendered section from `Agent::agents_md_section`.
+    pub fn agents_md(text: &str, file_count: usize) -> Self {
+        Self {
+            label: "AGENTS.md".to_string(),
+            tokens: xai_token_estimation::estimate_tokens(text),
+            detail: Some(count_detail(file_count as u64, "file")),
         }
     }
 }
@@ -463,8 +489,8 @@ pub struct ContextInfo {
     /// always matches the actual trigger (e.g. 65 for grok-build in remote settings).
     #[serde(default = "default_auto_compact_threshold")]
     pub auto_compact_threshold_percent: u8,
-    /// Itemized usage rows (skills listing, MCP server listing). Empty on
-    /// partial snapshots.
+    /// Itemized usage rows (skills, workflows, MCP servers, AGENTS.md).
+    /// Empty on partial snapshots.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub usage_categories: Vec<TokenUsageCategory>,
 }
@@ -503,7 +529,9 @@ pub struct SessionInfoData {
     pub model_display_name: Option<String>,
     pub resolved_model_id: Option<String>,
     pub model_fingerprint: Option<String>,
-    /// Catalog opt-in to display the served-checkpoint fingerprint for this model.
+    /// Catalog opt-in to display checkpoint identity (the served fingerprint and
+    /// the resolved model ID) for this model. Sole control: the client keeps no
+    /// built-in per-slug default, so turning this off in the catalog hides both.
     #[serde(default)]
     pub show_model_fingerprint: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -517,16 +545,6 @@ pub struct SessionInfoData {
     #[serde(default)]
     pub turn_index: u64,
     pub context: ContextInfo,
-}
-
-/// Whether this model slug supports showing checkpoint identity (resolved model ID, fingerprint).
-pub fn is_coding_model_slug(model: &str) -> bool {
-    matches!(model, "grok-build" | "grok-4.5")
-}
-
-/// Display gate for the model fingerprint: server/catalog opt-in OR the built-in coding-slug default.
-pub fn should_show_model_fingerprint(catalog_flag: bool, model_slug: &str) -> bool {
-    catalog_flag || is_coding_model_slug(model_slug)
 }
 
 /// Calculate and format the model name for display.
@@ -586,6 +604,9 @@ pub struct FeedbackContext {
 
 // ── Startup hints ───────────────────────────────────────────────────────
 
+// `pub` (not `pub(crate)`): carried by the public `SessionCommand` enum
+// (`UpdateAttachPolicy`), whose fields are reachable at `pub` — a
+// `pub(crate)` field type there trips the `private_interfaces` lint.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartupHints {
@@ -616,26 +637,57 @@ pub struct StartupHints {
     /// holds the parent's System and overwriting it would bust the cache prefix.
     #[serde(default)]
     pub preserve_inherited_system: bool,
+    /// Tool names (as the model sees them, e.g. `server__tool`) through which
+    /// this session delivers user-visible output. Declared by headless
+    /// surfaces whose users never see the model's plain-text responses —
+    /// output only reaches them via these tools. Opt-in: when empty (the
+    /// default), no behavior changes. Currently steers the MCP
+    /// connecting-reminder wording (`format_mcp_connecting_reminder`);
+    /// intended to also drive a turn-end delivery gate later.
+    #[serde(default)]
+    pub delivery_tools: Vec<String>,
+    /// Client-declared answer for permission prompts, for headless surfaces
+    /// with no client attached on agent-initiated turns (monitor wakes,
+    /// scheduled tasks). Only `"alwaysAllow"` is honored: would-be prompts
+    /// resolve as allow at the manager's dispatch gate, matching the
+    /// allow-always answer an attended interactive client would give.
+    /// Clamped off by the managed always-approve pin; a configured
+    /// `defaultMode` wins (see `apply_permission_mode_hint`).
+    ///
+    /// Spawn-time structural: applied when the manager is created, i.e.
+    /// `session/new` and cold `session/load` — a session stamped at creation
+    /// keeps the policy for its resident lifetime, and a leader restart
+    /// re-applies it on the next load. Unlike `yoloMode` / `autoMode`, a warm
+    /// re-attach to an already-resident actor does NOT re-apply it, so
+    /// stamping a continue on a live `Ask` session is a no-op (known gap:
+    /// adopting an existing interactive session into unattended auto-allow
+    /// needs a runtime prompt-policy update on the manager).
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+}
+
+impl StartupHints {
+    /// Resolve the MCP init strategy for an attachment carrying these hints:
+    /// `MCP_INIT_STRATEGY` env override, else `Blocking` for non-interactive
+    /// sessions, else `Progressive`. Shared by the spawn path and the
+    /// resident re-attach path so both resolve identically.
+    pub(crate) fn resolve_mcp_strategy(&self) -> xai_grok_telemetry::enums::McpInitStrategy {
+        use xai_grok_telemetry::enums::McpInitStrategy;
+        match std::env::var("MCP_INIT_STRATEGY") {
+            Ok(v) if !v.trim().is_empty() => McpInitStrategy::from(v),
+            _ if self.non_interactive => McpInitStrategy::Blocking,
+            _ => McpInitStrategy::Progressive,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn should_show_model_fingerprint_truth_table() {
-        // Catalog opt-in shows the fingerprint even for a non-coding slug.
-        assert!(should_show_model_fingerprint(true, "non-coding"));
-        // Coding slugs always show, even without the catalog flag.
-        assert!(should_show_model_fingerprint(false, "grok-build"));
-        assert!(should_show_model_fingerprint(false, "grok-4.5"));
-        // Non-coding slug without the flag stays hidden.
-        assert!(!should_show_model_fingerprint(false, "some-other"));
-    }
-
     /// Verify that the JSON payload Desktop sends (with `client_type: "desktop"`)
     /// deserializes correctly into `ClientFeedbackInput` and round-trips through
-    /// `to_submission()` preserving `ClientType::Desktop`.
+    /// `take_submission()` preserving `ClientType::Desktop`.
     #[test]
     fn desktop_client_type_deserializes_and_round_trips() {
         let json = r#"{
@@ -647,14 +699,14 @@ mod tests {
             "feedback_categories": ["accuracy"]
         }"#;
 
-        let input: ClientFeedbackInput = serde_json::from_str(json).unwrap();
+        let mut input: ClientFeedbackInput = serde_json::from_str(json).unwrap();
         assert_eq!(
             input.client_type,
             prod_mc_cli_chat_proxy_types::feedback_types::ClientType::Desktop
         );
         assert_eq!(input.session_id, "sess-1");
 
-        let submission = input.to_submission(Some("grok-3".into()), None, None, Some(5));
+        let submission = input.take_submission(Some("grok-3".into()), None, None, Some(5));
         assert_eq!(
             submission.client_type,
             prod_mc_cli_chat_proxy_types::feedback_types::ClientType::Desktop
@@ -913,5 +965,10 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let roundtripped: TokenUsageCategory = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtripped, original);
+
+        let agents = TokenUsageCategory::agents_md("rules", 1);
+        assert_eq!(agents.label, "AGENTS.md");
+        assert_eq!(agents.detail.as_deref(), Some("1 file"));
+        assert!(agents.tokens > 0);
     }
 }

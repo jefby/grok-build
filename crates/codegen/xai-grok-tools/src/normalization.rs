@@ -122,12 +122,14 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
         | ToolInput::EnterPlanMode(_)
         | ToolInput::ExitPlanMode(_)
         | ToolInput::AskUserQuestion(_)
+        | ToolInput::SendSubagentMessage(_)
         | ToolInput::Lsp(_)
         | ToolInput::Monitor(_)
         | ToolInput::SchedulerCreate(_)
         | ToolInput::SchedulerDelete(_)
         | ToolInput::SchedulerList(_)
         | ToolInput::UpdateGoal(_)
+        | ToolInput::Workflow(_)
         | ToolInput::Dynamic(_) => return None,
     })
 }
@@ -139,7 +141,7 @@ mod tests {
     }
     #[test]
     fn canonical_omits_absent_options_not_null() {
-        let grok = parse(serde_json::json!({ "variant" : "ReadFile", "target_file" : "/a" }));
+        let grok = parse(serde_json::json!({"variant":"ReadFile","target_file":"/a"}));
         let g = canonical_input(&grok).unwrap();
         let keys: Vec<&String> = g.as_object().unwrap().keys().collect();
         assert_eq!(

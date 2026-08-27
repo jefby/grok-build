@@ -86,7 +86,7 @@ impl xai_tool_runtime::Tool for EnterPlanModeTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "enter_plan_mode",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -121,17 +121,22 @@ impl xai_tool_runtime::Tool for EnterPlanModeTool {
             let (seed_target, plan_file_path) = resolve_plan_file_path(&res);
 
             // Resolve client-facing tool names via TemplateRenderer.
+            // Presence-aware lookups (not template renders): a missing kind
+            // renders as empty-`Ok`, so a `Result` fallback never fires.
             let hints = if let Some(renderer) = res.get::<TemplateRenderer>() {
                 EnterPlanModeToolHints {
                     ask_user: renderer
-                        .render("${{ tools.by_kind.ask_user }}")
-                        .unwrap_or_else(|_| "ask_user_question".to_owned()),
+                        .tool_for_kind(crate::types::tool::ToolKind::AskUser)
+                        .unwrap_or("ask_user_question")
+                        .to_owned(),
                     exit_plan: renderer
-                        .render("${{ tools.by_kind.exit_plan }}")
-                        .unwrap_or_else(|_| "exit_plan_mode".to_owned()),
+                        .tool_for_kind(crate::types::tool::ToolKind::ExitPlan)
+                        .unwrap_or("exit_plan_mode")
+                        .to_owned(),
                     task: renderer
-                        .render("${{ tools.by_kind.task }}")
-                        .unwrap_or_default(),
+                        .tool_for_kind(crate::types::tool::ToolKind::Task)
+                        .unwrap_or_default()
+                        .to_owned(),
                 }
             } else {
                 EnterPlanModeToolHints::default()
@@ -234,6 +239,25 @@ mod tests {
         (resources, plan)
     }
 
+    /// Compiled Empty-seed peer for the same path/hints, so seed-status
+    /// distinctness is checked without pinning instructional copy.
+    fn empty_seed_peer(output: &EnterPlanModeOutput) -> String {
+        match output {
+            EnterPlanModeOutput::Entered {
+                message,
+                plan_file_path,
+                tool_hints,
+                ..
+            } => ToolOutput::EnterPlanMode(EnterPlanModeOutput::Entered {
+                message: message.clone(),
+                plan_file_path: plan_file_path.clone(),
+                tool_hints: tool_hints.clone(),
+                plan_file_seed: PlanFileSeedStatus::Empty,
+            })
+            .to_prompt_format(),
+        }
+    }
+
     /// Parametrized FS mock: injects the read/write outcomes and counts calls
     /// so a test can assert the tool never touched the FS.
     struct ProbeMockFs {
@@ -282,8 +306,6 @@ mod tests {
             xai_tool_runtime::Tool::id(&tool).as_str(),
             "enter_plan_mode"
         );
-        let desc = crate::types::tool_metadata::ToolMetadata::description_template(&tool);
-        assert!(desc.contains("plan mode"));
     }
 
     #[test]
@@ -317,14 +339,10 @@ mod tests {
         .unwrap();
 
         let EnterPlanModeOutput::Entered {
-            ref message,
             ref plan_file_path,
             plan_file_seed,
             ..
         } = result;
-        assert!(message.contains("entered plan mode"));
-        assert!(message.contains("exploring the codebase"));
-        assert!(message.contains("implementation plan"));
         assert!(plan_file_path.contains("plan.md"));
         assert_eq!(plan_file_seed, PlanFileSeedStatus::Empty);
     }
@@ -391,15 +409,17 @@ mod tests {
             PlanFileSeedStatus::Missing(PlanFileSeedFailure::Unavailable)
         );
 
-        let output: ToolOutput = result.into();
-        let prompt = output.to_prompt_format();
+        let empty_peer = empty_seed_peer(&result);
+        let prompt = ToolOutput::EnterPlanMode(result).to_prompt_format();
         assert!(
-            prompt.contains("The plan file location is unavailable."),
-            "expected not-ready status: {prompt}"
+            prompt.contains(".grok/plan.md"),
+            "expected plan path: {prompt}"
         );
-        assert!(
-            prompt.contains("5. Write your plan to the plan file above"),
-            "expected constant write-plan step: {prompt}"
+        assert!(prompt.contains("exit_plan_mode"), "{prompt}");
+        assert!(prompt.contains("ask_user_question"), "{prompt}");
+        assert_ne!(
+            prompt, empty_peer,
+            "unavailable seed must change compiled status"
         );
     }
 
@@ -454,22 +474,9 @@ mod tests {
 
         let output: ToolOutput = result.into();
         let prompt = output.to_prompt_format();
-        assert!(prompt.contains("entered plan mode"));
         assert!(prompt.contains("plan.md"));
-        assert!(
-            prompt.contains("The file exists and is empty."),
-            "expected empty plan status: {prompt}"
-        );
         assert!(prompt.contains("exit_plan_mode"));
         assert!(prompt.contains("ask_user_question"));
-        assert!(prompt.contains("5. Write your plan to the plan file above"));
-        assert!(
-            prompt.contains("6. When ready, use exit_plan_mode to present your plan to the user")
-        );
-        assert!(
-            !prompt.contains("create it at that path first if needed"),
-            "ready path should not include not-ready create hint: {prompt}"
-        );
     }
 
     #[tokio::test]
@@ -495,11 +502,13 @@ mod tests {
         let bytes = fs.read_file(&plan_path).await.unwrap();
         assert_eq!(bytes, b"# prior plan\n");
 
-        let output: ToolOutput = result.into();
-        let prompt = output.to_prompt_format();
-        assert!(
-            prompt.contains("The file exists but is not empty."),
-            "expected nonempty status: {prompt}"
+        let empty_peer = empty_seed_peer(&result);
+        let prompt = ToolOutput::EnterPlanMode(result).to_prompt_format();
+        assert!(prompt.contains("plan.md"), "{prompt}");
+        assert!(prompt.contains("exit_plan_mode"), "{prompt}");
+        assert_ne!(
+            prompt, empty_peer,
+            "non-empty seed must change compiled status"
         );
     }
 

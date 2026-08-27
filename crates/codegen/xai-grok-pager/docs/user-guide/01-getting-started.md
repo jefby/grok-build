@@ -46,6 +46,16 @@ Update to the latest version at any time:
 grok update
 ```
 
+To fetch a repository through Grove (NFS on macOS, FUSE on Linux) after
+`[clone] enabled = true` in Grove config:
+
+```bash
+grok clone <url> [dir]
+```
+
+The default is a depth-1 checkout of the selected branch. Pass `--full-history`
+for a complete clone. See [grok clone](27-grok-clone.md).
+
 ---
 
 ## First Launch
@@ -78,7 +88,7 @@ Once authenticated, Grok presents a full-screen TUI with two main areas:
 
 Type a message and press `Enter` to send it. Grok reads files, runs commands, and edits code as needed. Each tool run streams into the scrollback in real time.
 
-Press `Tab` to move focus between the prompt and the scrollback. While a turn is running, `Ctrl+C` cancels it (or clears a non-empty draft first); `Esc` is a no-op mid-turn. Idle, press `Esc` twice within 800ms to clear a non-empty prompt, or (with an empty prompt and conversation messages) to open rewind — see [Keyboard Shortcuts](03-keyboard-shortcuts.md#escape). With the scrollback focused, use the arrow keys to select entries and to collapse or expand them. To navigate with `j`/`k` and fold with `h`/`l` instead, enable Vim mode.
+Press `Tab` to move focus between the prompt and the scrollback. While a turn is running, `Esc` cancels it (the exception is fullscreen vim scrollback mode, where mid-turn `Esc` is a no-op; minimal mode cancels even with vim on); `Ctrl+C` cancels once the composer is empty — with a draft, the first press only clears it. Idle, press `Esc` twice within 800ms to clear a non-empty prompt, or (with an empty prompt and conversation messages) to open rewind — see [Keyboard Shortcuts](03-keyboard-shortcuts.md#escape). With the scrollback focused, use the arrow keys to select entries and to collapse or expand them. To navigate with `j`/`k` and fold with `h`/`l` instead, enable Vim mode.
 
 ### File References
 
@@ -151,7 +161,7 @@ Tools can be extended with [MCP servers](05-configuration.md#mcp-servers) for in
 Type `/` in the prompt to access commands. These provide quick actions without writing a full prompt:
 
 ```
-/model grok-build                 # Switch model
+/model grok-4.6                 # Switch model
 /compact                          # Compress conversation history
 /always-approve                   # Toggle always-approve mode
 /new                              # Start a new session
@@ -186,7 +196,7 @@ grok --rules "Always use TypeScript. Prefer functional components."
 grok --yolo
 
 # Use a specific model
-grok -m grok-build
+grok -m grok-4.6
 
 # Resume a previous session
 grok --resume <session-id>

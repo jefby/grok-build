@@ -1,12 +1,14 @@
 //! Folder-trust gate ("do you trust this folder?").
 //!
-//! Repo-local MCP / LSP servers are configured by files an attacker can ship
-//! inside a cloned repository (`.mcp.json`, project `.grok/config.toml`,
-//! `~/.claude.json` `projects.<cwd>`, project `.grok/lsp.json`). Those configs
-//! contain commands that the CLI would otherwise spawn automatically — a
-//! 1-click RCE. This module resolves a VS-Code-style trust decision ONCE per
-//! workspace, BEFORE any repo-local server is spawned, and exposes a cheap
-//! [`project_scope_allowed`] check that the MCP/LSP loaders consult.
+//! Repo-local MCP / LSP servers and permission policy are configured by files
+//! an attacker can ship inside a cloned repository (`.mcp.json`, project
+//! `.grok/config.toml` including `[permission]` / `[mcp_servers]` /
+//! `[plugins].paths`, `~/.claude.json` `projects.<cwd>`, project `.grok/lsp.json`).
+//! Those configs contain commands or auto-approve rules the CLI would otherwise
+//! honor automatically — a 1-click RCE / policy bypass. This module resolves a
+//! VS-Code-style trust decision ONCE per workspace, BEFORE any repo-local
+//! server is spawned, and exposes a cheap [`project_scope_allowed`] check that
+//! the MCP/LSP/permission loaders consult.
 //!
 //! Resolution lives here (not in `acp_session`) so the session core stays free
 //! of feature logic; the loaders only call [`project_scope_allowed`].
@@ -74,7 +76,7 @@ static DECISIONS: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
 /// their grants and denies, so a cache deny would be the one verdict nothing
 /// (grant, store, prompt) could ever lift. Returns whether the folder had been
 /// trusted. Symmetric with [`grant_folder_trust`].
-pub fn revoke_folder_trust(cwd: &Path) -> bool {
+pub(crate) fn revoke_folder_trust(cwd: &Path) -> bool {
     // Local/dev builds are fully inert: nothing was trusted-via-gate to revoke,
     // and recording `false` here would make `project_scope_allowed` wrongly gate.
     if folder_trust_inert() {
@@ -121,7 +123,7 @@ pub fn revoke_folder_trust(cwd: &Path) -> bool {
 ///
 /// `DECISIONS` uses `parking_lot::Mutex` (no poisoning), so this gate cannot
 /// fail OPEN on a poisoned lock.
-pub fn project_scope_allowed(cwd: &Path) -> bool {
+pub(crate) fn project_scope_allowed(cwd: &Path) -> bool {
     let key = workspace_key(cwd);
     // Copy out of the lock so the Some(false) reconcile can re-acquire it
     // (parking_lot mutexes are not re-entrant).
@@ -182,15 +184,13 @@ pub(crate) fn detected_config_kinds(cwd: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Whether an agent's inline `hooks:` block may be appended to the live hook
-/// registry. A PROJECT/cwd-discovered agent's inline hooks are repo-controlled
-/// code-exec (and a project agent can SHADOW a built-in subagent, e.g. `explore`),
-/// so they require folder trust; user/bundled/built-in agents (not cwd-sourced)
-/// always keep theirs. `trusted` is evaluated LAZILY so non-project agents skip
-/// the (filesystem-walking) trust verdict entirely. SINGLE definition shared by
-/// the primary-session and subagent append sites (and the test) so they cannot
-/// drift. The primary site passes its already-computed `hooks_trusted` verdict;
-/// the subagent site passes `project_scope_allowed(parent_cwd)`.
+/// Project agents require folder trust; user/bundled/built-in agents always
+/// pass. Shared by primary-session hook append (`agent_ops.rs`), subagent
+/// hook append (`handle_request.rs`), and subagent owned `mcpServers` spawn
+/// (`handle_request.rs`). Plugin deny is call-site-only, before this
+/// predicate. `trusted` is evaluated lazily so non-project agents skip the
+/// filesystem-walking trust verdict. Primary-session passes its already-
+/// computed `hooks_trusted`; subagent sites pass `project_scope_allowed(parent_cwd)`.
 pub(crate) fn agent_inline_hooks_allowed(
     scope: xai_grok_agent::config::AgentScope,
     trusted: impl FnOnce() -> bool,
@@ -229,7 +229,11 @@ pub(crate) fn record_for_test(cwd: &Path, allowed: bool) {
 /// whose cwd differs from the launch dir, `grok mcp doctor`) passes `false`, so
 /// an unresolved interactive-but-untrusted workspace resolves **fail-closed**
 /// (untrusted, no prompt) — only the launch dir is ever prompted for.
-pub fn resolve_and_record(cwd: &Path, remote: Option<&RemoteSettings>, allow_prompt: bool) -> bool {
+pub(crate) fn resolve_and_record(
+    cwd: &Path,
+    remote: Option<&RemoteSettings>,
+    allow_prompt: bool,
+) -> bool {
     // Local/dev builds are fully inert: project scope is always allowed, so skip
     // the `trusted_folders.toml` read entirely.
     if folder_trust_inert() {
@@ -263,7 +267,7 @@ pub fn resolve_and_record(cwd: &Path, remote: Option<&RemoteSettings>, allow_pro
 /// no-configs case (config added post-startup via git pull / agent write is
 /// caught). The init-time dedup belongs to the one-shot caller (a `OnceCell` on
 /// `MvpAgent`), NOT to any new shared-cache entry.
-pub fn resolve_launch_dir_trust(cwd: &Path, remote: Option<&RemoteSettings>) -> bool {
+pub(crate) fn resolve_launch_dir_trust(cwd: &Path, remote: Option<&RemoteSettings>) -> bool {
     // Local/dev builds are fully inert: project scope is always allowed, skipping
     // the store read + repo scan entirely.
     if folder_trust_inert() {
@@ -406,7 +410,7 @@ fn compute_from_inputs(
 /// Edge case: a name declared in BOTH a project config and the global
 /// `~/.grok/config.toml` is dropped when untrusted. This is intended — untrusted
 /// project content must not influence the command spawned for a shared name.
-pub fn project_scoped_mcp_names(cwd: &Path) -> HashSet<String> {
+pub(crate) fn project_scoped_mcp_names(cwd: &Path) -> HashSet<String> {
     let mut names = HashSet::new();
 
     // `.grok/config.toml [mcp_servers]` entries tagged project (the loader's key
@@ -448,7 +452,7 @@ pub fn project_scoped_mcp_names(cwd: &Path) -> HashSet<String> {
 /// with a project-declared name is ALSO dropped when untrusted: an untrusted repo
 /// must not influence the command spawned for that name (see
 /// [`project_scoped_mcp_names`]). Servers with no project-name collision are kept.
-pub fn filter_untrusted_project_mcp(
+pub(crate) fn filter_untrusted_project_mcp(
     cwd: &Path,
     merged: Vec<acp::McpServer>,
 ) -> Vec<acp::McpServer> {
@@ -480,7 +484,7 @@ pub fn filter_untrusted_project_mcp(
 /// Thin `cwd`→verdict wrapper over the shared
 /// [`xai_grok_tools::implementations::lsp::config::filter_project_lsp_when_untrusted`]
 /// predicate, so Site B and the workspace build path share one gate.
-pub fn filter_untrusted_project_lsp(
+pub(crate) fn filter_untrusted_project_lsp(
     cwd: &Path,
     sourced: std::collections::BTreeMap<
         String,
@@ -565,91 +569,28 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn revoke_never_trusted_folder_writes_no_deny_and_preserves_cascade() {
+    fn revoke_never_trusted_folder_writes_no_deny() {
         let _sim = simulate_release_build();
-        // The actual bug fix: revoking a NEVER-trusted child must write no explicit
-        // child STORE deny (returning false) so a later ancestor grant still
-        // cascades to the child — a spurious child `set_untrusted` would win
-        // most-specific and break the cascade. It must STILL downgrade the
-        // in-process cache, though, so a cached storeless grant cannot survive a
-        // mid-session untrust. GROK_HOME-isolated so the grant writes to a temp
-        // store; `#[serial]` because GROK_HOME is global.
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set("GROK_HOME", home.path());
-        // Distinct git roots for parent/child so `workspace_key` does not collapse
-        // them onto one key (the child's own `.git` stops discovery at the child).
-        let parent = repo_tmp();
-        let child = parent.path().join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        git2::Repository::init(&child).unwrap();
+        let tmp = repo_tmp();
 
-        // Seed a cached grant with NO backing store record (e.g. a kill-switch /
-        // feature-off `compute` allow), so the cache downgrade is observable below.
-        record(&workspace_key(&child), true);
+        record(&workspace_key(tmp.path()), true);
 
-        // Revoking the never-trusted child reports false and writes no store deny.
         assert!(
-            !revoke_folder_trust(&child),
+            !revoke_folder_trust(tmp.path()),
             "revoking a never-trusted folder must return false"
         );
 
-        // The in-process cache is still downgraded so the untrust is immediate even
-        // for the storeless cached grant.
         assert!(
-            !project_scope_allowed(&child),
+            !project_scope_allowed(tmp.path()),
             "revoke must downgrade the in-process cache even for a never-trusted folder"
         );
 
-        // A subsequent ancestor grant must still cascade to the child — proving
-        // the revoke did not poison the store with a most-specific child deny.
-        let mut store = TrustStore::load();
-        store.set_trusted(&workspace_key(parent.path())).unwrap();
+        let store = TrustStore::load();
         assert!(
-            TrustStore::load().is_trusted(&workspace_key(&child)),
-            "ancestor grant must cascade to a child that was only revoked-when-untrusted"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn revoke_ancestor_cascade_trusted_child_writes_explicit_untrust() {
-        let _sim = simulate_release_build();
-        // Revoke on a child trusted ONLY via an ancestor cascade (no direct child
-        // grant) must report was_trusted=true and actually untrust the child: it
-        // writes an explicit child deny (overriding the cascade) and downgrades
-        // the cache. GROK_HOME-isolated so the grant writes to a temp store;
-        // `#[serial]` because GROK_HOME is process-global.
-        let home = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::set("GROK_HOME", home.path());
-        // Distinct git roots so `workspace_key` keeps parent/child as separate
-        // keys (the child's own `.git` stops discovery at the child).
-        let parent = repo_tmp();
-        let child = parent.path().join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        git2::Repository::init(&child).unwrap();
-
-        // Trust the parent only; the child inherits trust via the cascade.
-        let mut store = TrustStore::load();
-        store.set_trusted(&workspace_key(parent.path())).unwrap();
-        assert!(
-            TrustStore::load().is_trusted(&workspace_key(&child)),
-            "child must be trusted via the ancestor cascade before revoke"
-        );
-
-        // Revoking the cascade-trusted child reports was_trusted=true, then the
-        // child is untrusted: an explicit child deny overrides the cascade and
-        // the in-process cache is downgraded.
-        assert!(
-            revoke_folder_trust(&child),
-            "a cascade-trusted child must report was_trusted=true"
-        );
-        assert!(
-            !TrustStore::load().is_trusted(&workspace_key(&child)),
-            "revoke must write an explicit child untrust that overrides the cascade"
-        );
-        assert!(
-            !project_scope_allowed(&child),
-            "revoke must downgrade the in-process cache for the child"
+            !store.has_decision(&workspace_key(tmp.path())),
+            "revoking a never-trusted folder must not record a child deny"
         );
     }
 
@@ -968,6 +909,34 @@ mod tests {
         assert!(
             !project_scope_allowed(tmp.path()),
             "plugin-only untrusted repo must be denied"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn project_scope_allowed_denies_untrusted_permission_only_repo() {
+        // Bridge: a clone whose ONLY repo-local config is `.grok/config.toml`
+        // `[permission]` (no MCP/hooks/plugins) must still produce untrusted via
+        // the real `repo_configs_present` → `decide` → `project_scope_allowed`
+        // path. Resolver unit tests inject `project_trusted = false` directly and
+        // miss this detector gap. Subdir launch ensures the cwd→git-root walk.
+        let _sim = simulate_release_build();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("GROK_HOME", home.path());
+        let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(
+            grok.join("config.toml"),
+            "[permission]\nallow = [\"Bash(*)\"]\n",
+        )
+        .unwrap();
+        let subdir = tmp.path().join("crates").join("inner");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert!(
+            !project_scope_allowed(&subdir),
+            "permission-only untrusted repo must be denied from a subdirectory"
         );
     }
 

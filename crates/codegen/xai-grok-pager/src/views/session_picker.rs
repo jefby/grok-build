@@ -20,6 +20,17 @@ use crate::views::picker::{PickerEntry, PickerField, PickerRow, PickerState};
 /// they don't collide with fuzzy-entry indices.
 pub const CONTENT_EXPAND_OFFSET: usize = 100_000;
 
+/// Session id for free-text Enter (`SubmitQuery` with no selectable rows).
+///
+/// Only a trimmed UUID is loadable — pasted garbage must not call
+/// `LoadSession` (that left the TUI stuck mid-load).
+pub fn session_id_for_direct_load(query: &str) -> Option<&str> {
+    let q = query.trim();
+    // `Uuid::try_parse` rejects empty, multi-line, and non-UUID text.
+    uuid::Uuid::try_parse(q).ok()?;
+    Some(q)
+}
+
 /// Derive a short repo display name from a CWD path.
 ///
 /// Uses the last 2 normal path components joined by `-`. For paths with
@@ -78,6 +89,89 @@ pub enum PickerItem {
     Content { hit_index: usize },
 }
 
+/// A session armed for deletion, captured on `d` so the `y` confirm keeps
+/// a valid `(source, session_id, cwd)` even if the lists shift. Shared by
+/// the welcome and modal `/resume` pickers so they can't drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDelete {
+    pub source: String,
+    pub session_id: String,
+    pub cwd: String,
+}
+
+/// Outcome of routing a key through an armed [`PendingDelete`] confirm.
+pub(crate) enum PendingDeleteKey {
+    /// `y`: caller should delete this session.
+    Confirm(PendingDelete),
+    /// `n`: arm cleared; caller should redraw.
+    Cancel,
+    /// Other key: arm cleared, but the key should still be processed.
+    Disarmed,
+    /// Nothing armed, or not an unmodified key press.
+    NotArmed,
+}
+
+/// Arm a [`PendingDelete`] from the selected row, or `None` if it can't be
+/// deleted (foreign source or non-selectable position).
+pub(crate) fn pending_delete_from_selection(
+    selected: usize,
+    entry_map: &[Option<PickerItem>],
+    entries: Option<&[SessionPickerEntry]>,
+    content_results: Option<&[xai_grok_shell::extensions::session_search::SearchSessionHit]>,
+) -> Option<PendingDelete> {
+    match entry_map.get(selected).and_then(|e| e.as_ref())? {
+        PickerItem::Fuzzy { original_index } => entries
+            .and_then(|e| e.get(*original_index))
+            .filter(|entry| !crate::app::is_foreign_picker_source(&entry.source))
+            .map(|e| PendingDelete {
+                source: e.source.clone(),
+                session_id: e.id.clone(),
+                cwd: e.cwd.clone(),
+            }),
+        PickerItem::Content { hit_index } => {
+            content_results
+                .and_then(|h| h.get(*hit_index))
+                .map(|h| PendingDelete {
+                    source: "local".into(),
+                    session_id: h.session_id.clone(),
+                    cwd: h.cwd.clone(),
+                })
+        }
+    }
+}
+
+/// Route a key through an armed [`PendingDelete`]: `y` confirms, `n`
+/// cancels, any other unmodified key disarms and falls through.
+pub(crate) fn handle_pending_delete_key(
+    pending: &mut Option<PendingDelete>,
+    ev: &crossterm::event::Event,
+) -> PendingDeleteKey {
+    use crossterm::event::{Event, KeyCode, KeyEventKind};
+    if pending.is_none() {
+        return PendingDeleteKey::NotArmed;
+    }
+    let Event::Key(k) = ev else {
+        return PendingDeleteKey::NotArmed;
+    };
+    if k.kind != KeyEventKind::Press || !k.modifiers.is_empty() {
+        return PendingDeleteKey::NotArmed;
+    }
+    match k.code {
+        KeyCode::Char('y') => pending
+            .take()
+            .map(PendingDeleteKey::Confirm)
+            .unwrap_or(PendingDeleteKey::Cancel),
+        KeyCode::Char('n') => {
+            *pending = None;
+            PendingDeleteKey::Cancel
+        }
+        _ => {
+            *pending = None;
+            PendingDeleteKey::Disarmed
+        }
+    }
+}
+
 /// Owned data for a single session picker row. Built once per frame and
 /// then borrowed by `PickerEntry` / `PickerField` slices. Shared between
 /// the welcome-screen `render_session_picker` and the
@@ -117,54 +211,135 @@ impl SessionPickerLanes {
     }
 }
 
+/// Loading gate for a session picker surface's spinner: nothing to show yet —
+/// no loaded entry passes the source filter — while the native fetch or
+/// foreign scan is still in flight. The filter check (not `entries.is_none()`)
+/// matters because the fast foreign scan can land rows the default Grok view
+/// hides before the native list arrives; the empty state must wait until both
+/// lanes settle. Shared by rendering, redraw forcing, and tick demand so the
+/// three cannot drift (a spinner that renders without demanding ticks parks
+/// on its first frame).
+pub(crate) fn loading_spinner_active(
+    entries: Option<&[SessionPickerEntry]>,
+    source_filter: SourceFilter,
+    loading: bool,
+    lanes: &SessionPickerLanes,
+) -> bool {
+    let nothing_visible = entries.is_none_or(|entries| {
+        !entries
+            .iter()
+            .any(|entry| source_filter.matches(&entry.source, entry.session_kind.as_deref()))
+    });
+    if nothing_visible && (loading || lanes.foreign_loading) {
+        return true;
+    }
+    // External is the foreign cache: an Exclude refetch cannot change it.
+    if source_filter.is_content_search_disabled() {
+        return false;
+    }
+    // Native refetch in flight with only foreign (or Headless) rows matching:
+    // the visible cache is not the policy being fetched.
+    loading
+        && entries.is_none_or(|entries| {
+            !entries.iter().any(|entry| {
+                !crate::app::is_foreign_picker_source(&entry.source)
+                    && source_filter.matches(&entry.source, entry.session_kind.as_deref())
+            })
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Source filter
 // ---------------------------------------------------------------------------
 
-/// Filter session entries by native, remote, or external source.
+/// Filter session entries by native, headless, remote, or external source.
+///
+/// Default is [`Self::Grok`]: native Grok sessions only (local / remote /
+/// conversation), so `/resume` does not mix Claude/Codex/Cursor foreign
+/// sessions or `grok -p` one-shots into the list. `f` cycles Grok → Headless →
+/// External → All → Local → Remote. Entering or leaving `Headless` refetches:
+/// the shell excludes headless rows from every other page's fetch, so a
+/// client-side refilter of the cached page could never populate it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SourceFilter {
+    /// Native Grok sessions only — excludes Claude/Codex/Cursor foreign rows.
     #[default]
-    All,
+    Grok,
+    /// `grok -p` one-shots only (`session_kind == "headless"`).
+    Headless,
     Local,
     Remote,
     External,
+    /// Every source, including foreign agent sessions — but not headless rows.
+    All,
 }
 
 impl SourceFilter {
     pub fn label(self) -> &'static str {
         match self {
-            Self::All => "All",
+            Self::Grok => "Grok",
+            Self::Headless => "Headless",
             Self::Local => "Local",
             Self::Remote => "Remote",
             Self::External => "External",
+            Self::All => "All",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
+            Self::Grok => Self::Headless,
+            Self::Headless => Self::External,
+            Self::External => Self::All,
             Self::All => Self::Local,
             Self::Local => Self::Remote,
-            Self::Remote => Self::External,
-            Self::External => Self::All,
+            Self::Remote => Self::Grok,
         }
     }
 
     /// Returns `true` when a non-default filter is selected.
     pub fn is_active(self) -> bool {
-        self != Self::All
+        self != Self::Grok
     }
 
-    /// Returns `true` if a session with the given `source` string passes the filter.
+    /// Whether the deep content search is unavailable on this page: foreign
+    /// stores are not FTS-indexed. The Headless page searches like every
+    /// native page; the server filters hits by the page's headless policy.
+    pub fn is_content_search_disabled(self) -> bool {
+        self == Self::External
+    }
+
+    /// The server-side headless policy a fetch or content search for this
+    /// page must carry: `Only` on the Headless page, `Exclude` everywhere
+    /// else (foreign rows are never headless, so External keeps the default).
+    pub fn headless_policy(self) -> xai_grok_shell::session::unified_list::HeadlessPolicy {
+        use xai_grok_shell::session::unified_list::HeadlessPolicy;
+        if self == Self::Headless {
+            HeadlessPolicy::Only
+        } else {
+            HeadlessPolicy::Exclude
+        }
+    }
+
+    /// Returns `true` if a session with the given `source` string and
+    /// `session_kind` passes the filter.
     ///
     /// grok.com conversations carry `source == "conversation"` and live remotely,
-    /// so they pass the `Remote` filter (and `All`) but not `Local`.
-    pub fn matches(self, source: &str) -> bool {
+    /// so they pass the `Remote` filter (and `Grok` / `All`) but not `Local`.
+    /// Foreign sources (`claude` / `codex` / `cursor`) only pass `External` and
+    /// `All`. Headless rows pass only `Headless`; every other page excludes
+    /// them, mirroring the server-side fetch policy.
+    pub fn matches(self, source: &str, session_kind: Option<&str>) -> bool {
+        let is_headless = session_kind == Some("headless");
         match self {
-            Self::All => true,
-            Self::Local => source == "local" || source == "both",
-            Self::Remote => source == "remote" || source == "both" || source == "conversation",
+            Self::Grok => !crate::app::is_foreign_picker_source(source) && !is_headless,
+            Self::Headless => is_headless && !crate::app::is_foreign_picker_source(source),
+            Self::Local => (source == "local" || source == "both") && !is_headless,
+            Self::Remote => {
+                (source == "remote" || source == "both" || source == "conversation") && !is_headless
+            }
             Self::External => crate::app::is_foreign_picker_source(source),
+            Self::All => !is_headless,
         }
     }
 }
@@ -339,7 +514,7 @@ pub(crate) fn filter_session_entries(
         .iter()
         .enumerate()
         .filter(|(_, e)| {
-            source_filter.matches(&e.source)
+            source_filter.matches(&e.source, e.session_kind.as_deref())
                 && (query.is_empty()
                     || fuzzy_matches_session(&e.id, &q)
                     || fuzzy_matches_session(&e.summary, &q))
@@ -377,7 +552,7 @@ pub(crate) fn build_virtual_list(
         .into_iter()
         .map(|i| PickerItem::Fuzzy { original_index: i })
         .collect();
-    if source_filter != SourceFilter::External
+    if !source_filter.is_content_search_disabled()
         && let Some(hits) = content_results
     {
         for (hit_idx, hit) in hits.iter().enumerate() {
@@ -449,7 +624,7 @@ pub(crate) fn build_entry_map(
                     .map(|entry| entry.id.as_str())
             })
             .collect();
-        let content_items: Vec<usize> = if source_filter != SourceFilter::External
+        let content_items: Vec<usize> = if !source_filter.is_content_search_disabled()
             && let Some(hits) = content_results
             && !query.is_empty()
         {
@@ -462,7 +637,7 @@ pub(crate) fn build_entry_map(
             Vec::new()
         };
         let show_content_header = !content_items.is_empty()
-            || (source_filter != SourceFilter::External
+            || (!source_filter.is_content_search_disabled()
                 && content_loading
                 && !query.trim().is_empty());
         if show_content_header {
@@ -473,7 +648,7 @@ pub(crate) fn build_entry_map(
         }
         map
     } else {
-        let content_for_flat = if query.is_empty() || source_filter == SourceFilter::External {
+        let content_for_flat = if query.is_empty() || source_filter.is_content_search_disabled() {
             None
         } else {
             content_results
@@ -485,7 +660,7 @@ pub(crate) fn build_entry_map(
             .count();
         let content_count = virtual_list.len() - fuzzy_count;
         let has_header = content_count > 0
-            || (source_filter != SourceFilter::External
+            || (!source_filter.is_content_search_disabled()
                 && content_loading
                 && !query.trim().is_empty());
         let mut map = Vec::with_capacity(virtual_list.len() + usize::from(has_header));
@@ -551,6 +726,7 @@ pub(crate) fn session_picker_worktree_selection(
 }
 
 /// Rebuild backing-index expansion after a session query changes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_session_picker_query_expansion(
     entries: Option<&[SessionPickerEntry]>,
     content_results: Option<&[xai_grok_shell::extensions::session_search::SearchSessionHit]>,
@@ -627,13 +803,25 @@ pub(crate) fn build_session_entry_data(
                 if entry.num_messages > 0 {
                     field_data.push(("Messages".into(), entry.num_messages.to_string()));
                 }
+                // Recap ("where was I") and the last-turn summary, whenever
+                // available. Truncated to the card width like the Prompt line.
+                let max_w = content_width.saturating_sub(4 + 12) as usize;
+                if let Some(recap) = entry.last_recap.as_deref().map(str::trim)
+                    && !recap.is_empty()
+                {
+                    field_data.push(("Recap".into(), truncate_str(recap, max_w)));
+                }
+                if let Some(last_turn) = entry.last_turn_summary.as_deref().map(str::trim)
+                    && !last_turn.is_empty()
+                {
+                    field_data.push(("Last turn".into(), truncate_str(last_turn, max_w)));
+                }
                 if let Some(ref detail) = entry.card_detail {
                     field_data.push((
                         "Turns".into(),
                         format!("{}    Tools  {}", detail.turn_count, detail.tool_call_count),
                     ));
                     if !detail.first_prompt_preview.is_empty() {
-                        let max_w = content_width.saturating_sub(4 + 12) as usize;
                         let preview = truncate_str(&detail.first_prompt_preview, max_w);
                         field_data.push(("Prompt".into(), preview));
                     }
@@ -817,6 +1005,26 @@ pub(crate) fn build_content_header_label(
     }
 }
 
+/// Hint for external sessions hidden on the Headless page.
+pub(crate) fn hidden_external_hint(
+    entries: Option<&[SessionPickerEntry]>,
+    source_filter: SourceFilter,
+) -> Option<String> {
+    match source_filter {
+        SourceFilter::Headless => {
+            let hidden = entries?
+                .iter()
+                .filter(|entry| crate::app::is_foreign_picker_source(&entry.source))
+                .count();
+            (hidden > 0).then(|| {
+                let plural = if hidden == 1 { "" } else { "s" };
+                format!("{hidden} external session{plural} hidden \u{b7} f to show")
+            })
+        }
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
@@ -956,6 +1164,9 @@ mod tests {
             branch: None,
             repo_name: repo.into(),
             worktree_label: None,
+            last_turn_summary: None,
+            last_recap: None,
+            session_kind: None,
             card_detail: None,
         }
     }
@@ -1282,44 +1493,58 @@ mod tests {
 
     #[test]
     fn source_filter_matches() {
-        assert!(SourceFilter::All.matches("local"));
-        assert!(SourceFilter::All.matches("remote"));
-        assert!(SourceFilter::All.matches("both"));
-        assert!(SourceFilter::All.matches("claude"));
-        assert!(SourceFilter::All.matches("codex"));
-        assert!(SourceFilter::All.matches("cursor"));
+        // Default Grok filter: native only (not Claude/Codex/Cursor).
+        assert!(SourceFilter::Grok.matches("local", None));
+        assert!(SourceFilter::Grok.matches("remote", None));
+        assert!(SourceFilter::Grok.matches("both", None));
+        assert!(SourceFilter::Grok.matches("conversation", None));
+        assert!(!SourceFilter::Grok.matches("claude", None));
+        assert!(!SourceFilter::Grok.matches("codex", None));
+        assert!(!SourceFilter::Grok.matches("cursor", None));
 
-        assert!(SourceFilter::Local.matches("local"));
-        assert!(SourceFilter::Local.matches("both"));
-        assert!(!SourceFilter::Local.matches("remote"));
-        assert!(!SourceFilter::Local.matches("claude"));
+        assert!(SourceFilter::All.matches("local", None));
+        assert!(SourceFilter::All.matches("remote", None));
+        assert!(SourceFilter::All.matches("both", None));
+        assert!(SourceFilter::All.matches("claude", None));
+        assert!(SourceFilter::All.matches("codex", None));
+        assert!(SourceFilter::All.matches("cursor", None));
 
-        assert!(SourceFilter::Remote.matches("remote"));
-        assert!(SourceFilter::Remote.matches("both"));
-        assert!(!SourceFilter::Remote.matches("local"));
-        assert!(!SourceFilter::Remote.matches("cursor"));
+        assert!(SourceFilter::Local.matches("local", None));
+        assert!(SourceFilter::Local.matches("both", None));
+        assert!(!SourceFilter::Local.matches("remote", None));
+        assert!(!SourceFilter::Local.matches("claude", None));
 
-        // grok.com conversations are remote: visible under All + Remote, not Local.
-        assert!(SourceFilter::All.matches("conversation"));
-        assert!(SourceFilter::Remote.matches("conversation"));
-        assert!(!SourceFilter::Local.matches("conversation"));
+        assert!(SourceFilter::Remote.matches("remote", None));
+        assert!(SourceFilter::Remote.matches("both", None));
+        assert!(!SourceFilter::Remote.matches("local", None));
+        assert!(!SourceFilter::Remote.matches("cursor", None));
 
-        assert!(SourceFilter::External.matches("claude"));
-        assert!(SourceFilter::External.matches("codex"));
-        assert!(SourceFilter::External.matches("cursor"));
-        assert!(!SourceFilter::External.matches("local"));
-        assert!(!SourceFilter::External.matches("remote"));
-        assert!(!SourceFilter::External.matches("both"));
-        assert!(!SourceFilter::External.matches("conversation"));
+        // grok.com conversations are remote: visible under Grok + All + Remote, not Local.
+        assert!(SourceFilter::All.matches("conversation", None));
+        assert!(SourceFilter::Remote.matches("conversation", None));
+        assert!(!SourceFilter::Local.matches("conversation", None));
+
+        assert!(SourceFilter::External.matches("claude", None));
+        assert!(SourceFilter::External.matches("codex", None));
+        assert!(SourceFilter::External.matches("cursor", None));
+        assert!(!SourceFilter::External.matches("local", None));
+        assert!(!SourceFilter::External.matches("remote", None));
+        assert!(!SourceFilter::External.matches("both", None));
+        assert!(!SourceFilter::External.matches("conversation", None));
     }
 
     #[test]
     fn source_filter_cycles() {
+        assert_eq!(SourceFilter::Grok.next(), SourceFilter::Headless);
+        assert_eq!(SourceFilter::Headless.next(), SourceFilter::External);
+        assert_eq!(SourceFilter::External.next(), SourceFilter::All);
         assert_eq!(SourceFilter::All.next(), SourceFilter::Local);
         assert_eq!(SourceFilter::Local.next(), SourceFilter::Remote);
-        assert_eq!(SourceFilter::Remote.next(), SourceFilter::External);
-        assert_eq!(SourceFilter::External.next(), SourceFilter::All);
+        assert_eq!(SourceFilter::Remote.next(), SourceFilter::Grok);
+        assert_eq!(SourceFilter::Grok.label(), "Grok");
+        assert_eq!(SourceFilter::Headless.label(), "Headless");
         assert_eq!(SourceFilter::External.label(), "External");
+        assert_eq!(SourceFilter::default(), SourceFilter::Grok);
     }
 
     #[test]
@@ -1329,23 +1554,31 @@ mod tests {
             e.source = source.into();
             e
         }
-        let entries = vec![
+        let mut entries = vec![
             entry_with_source("s0", "local"),
             entry_with_source("s1", "remote"),
             entry_with_source("s2", "both"),
             entry_with_source("s3", "claude"),
             entry_with_source("s4", "codex"),
             entry_with_source("s5", "cursor"),
+            entry_with_source("s6", "local"),
         ];
+        entries[6].session_kind = Some("headless".into());
+
+        let grok = filter_session_entries(Some(&entries), "", SourceFilter::Grok);
+        assert_eq!(grok, vec![0, 1, 2]);
+
+        let headless = filter_session_entries(Some(&entries), "", SourceFilter::Headless);
+        assert_eq!(headless, vec![6]);
 
         let all = filter_session_entries(Some(&entries), "", SourceFilter::All);
         assert_eq!(all, vec![0, 1, 2, 3, 4, 5]);
 
         let local = filter_session_entries(Some(&entries), "", SourceFilter::Local);
-        assert_eq!(local, vec![0, 2]); // local + both
+        assert_eq!(local, vec![0, 2]);
 
         let remote = filter_session_entries(Some(&entries), "", SourceFilter::Remote);
-        assert_eq!(remote, vec![1, 2]); // remote + both
+        assert_eq!(remote, vec![1, 2]);
 
         let external = filter_session_entries(Some(&entries), "", SourceFilter::External);
         assert_eq!(external, vec![3, 4, 5]);
@@ -1353,24 +1586,89 @@ mod tests {
 
     #[test]
     fn source_filter_empty_and_unknown_source() {
-        // Empty source string (e.g. from old data or test fixtures) should
-        // only pass the All filter, never Local or Remote.
-        assert!(SourceFilter::All.matches(""));
-        assert!(!SourceFilter::Local.matches(""));
-        assert!(!SourceFilter::Remote.matches(""));
+        // Empty / unknown source (e.g. from old data or test fixtures) is not
+        // foreign, so it passes Grok + All but never Local, Remote, or External.
+        assert!(SourceFilter::Grok.matches("", None));
+        assert!(SourceFilter::All.matches("", None));
+        assert!(!SourceFilter::Local.matches("", None));
+        assert!(!SourceFilter::Remote.matches("", None));
+        assert!(!SourceFilter::External.matches("", None));
 
-        // Unknown source values are also rejected by Local/Remote.
-        assert!(SourceFilter::All.matches("unknown"));
-        assert!(!SourceFilter::Local.matches("unknown"));
-        assert!(!SourceFilter::Remote.matches("unknown"));
+        assert!(SourceFilter::Grok.matches("unknown", None));
+        assert!(SourceFilter::All.matches("unknown", None));
+        assert!(!SourceFilter::Local.matches("unknown", None));
+        assert!(!SourceFilter::Remote.matches("unknown", None));
+        assert!(!SourceFilter::External.matches("unknown", None));
     }
 
     #[test]
     fn source_filter_is_active() {
-        assert!(!SourceFilter::All.is_active());
+        assert!(!SourceFilter::Grok.is_active());
+        assert!(SourceFilter::Headless.is_active());
         assert!(SourceFilter::Local.is_active());
         assert!(SourceFilter::Remote.is_active());
         assert!(SourceFilter::External.is_active());
+        assert!(SourceFilter::All.is_active());
+    }
+
+    #[test]
+    fn hidden_external_hint_visibility() {
+        fn entry_with_source(id: &str, source: &str) -> SessionPickerEntry {
+            let mut e = make_entry(id, "r");
+            e.source = source.into();
+            e
+        }
+        let entries = vec![
+            entry_with_source("s0", "local"),
+            entry_with_source("s1", "claude"),
+            entry_with_source("s2", "codex"),
+        ];
+
+        assert!(hidden_external_hint(Some(&entries), SourceFilter::Grok).is_none());
+        assert!(hidden_external_hint(Some(&entries), SourceFilter::Local).is_none());
+        assert!(hidden_external_hint(Some(&entries), SourceFilter::Remote).is_none());
+        assert!(hidden_external_hint(Some(&entries), SourceFilter::Headless).is_some());
+        assert!(hidden_external_hint(Some(&entries), SourceFilter::External).is_none());
+        assert!(hidden_external_hint(Some(&entries), SourceFilter::All).is_none());
+
+        let native = vec![entry_with_source("s0", "local")];
+        assert!(hidden_external_hint(Some(&native), SourceFilter::Headless).is_none());
+        assert!(hidden_external_hint(None, SourceFilter::Headless).is_none());
+    }
+
+    /// The expanded resume card surfaces the recap and last-turn summary when
+    /// present, and omits those rows when absent.
+    #[test]
+    fn expanded_card_shows_recap_and_last_turn_when_present() {
+        let mut entry = make_entry("s_recap", "repo");
+        entry.source = "local".into();
+        entry.last_recap = Some("Where we left off: auth refactor".into());
+        entry.last_turn_summary = Some("Wired retries into billing".into());
+        let mut state = PickerState::default();
+        state.expanded.insert(0);
+
+        let built = build_session_entry_data(&[entry], &[0], &state, 80);
+        let has = |label: &str, value: &str| {
+            built[0]
+                .field_data
+                .iter()
+                .any(|(l, v)| l == label && v.contains(value))
+        };
+        assert!(has("Recap", "auth refactor"), "recap row missing");
+        assert!(has("Last turn", "billing"), "last-turn row missing");
+
+        // Absent when the entry has neither.
+        let bare = make_entry("s_bare", "repo");
+        let mut state = PickerState::default();
+        state.expanded.insert(0);
+        let built = build_session_entry_data(&[bare], &[0], &state, 80);
+        assert!(
+            !built[0]
+                .field_data
+                .iter()
+                .any(|(l, _)| l == "Recap" || l == "Last turn"),
+            "recap/last-turn rows must be omitted when absent"
+        );
     }
 
     #[test]
@@ -1526,5 +1824,17 @@ mod tests {
             map[1],
             Some(PickerItem::Fuzzy { original_index: 0 })
         ));
+    }
+
+    #[test]
+    fn session_id_for_direct_load_accepts_uuid_only() {
+        let sid = "019fb61a-85a5-7ba0-a4ec-24647dca1893";
+        assert_eq!(session_id_for_direct_load(sid), Some(sid));
+        assert_eq!(session_id_for_direct_load(&format!("  {sid}  ")), Some(sid));
+        assert_eq!(session_id_for_direct_load("not-a-uuid"), None);
+        assert_eq!(session_id_for_direct_load(""), None);
+        assert_eq!(session_id_for_direct_load("pasted garbage!!!"), None);
+        assert_eq!(session_id_for_direct_load("hello\nworld"), None);
+        assert_eq!(session_id_for_direct_load(&format!("{sid}\nextra")), None);
     }
 }

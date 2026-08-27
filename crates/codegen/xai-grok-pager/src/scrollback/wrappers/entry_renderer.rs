@@ -1,5 +1,7 @@
 //! EntryRenderer - renders a ScrollbackEntry using composed wrappers.
 
+use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::path::Path;
 
 use ratatui::buffer::Buffer;
@@ -23,7 +25,10 @@ const WAVE_SPEED: f32 = 0.15;
 pub struct EntryRenderer<'a> {
     entry: &'a ScrollbackEntry,
     theme: &'a Theme,
-    appearance: AppearanceConfig,
+    /// Deliberately NOT eagerly `AppearanceConfig::default()`: that conversion
+    /// reads `Theme::current()` and quantizes every color, and profiling a
+    /// resize showed it running once per entry only to be overwritten.
+    appearance: OnceCell<Cow<'a, AppearanceConfig>>,
     tick: u64,
     /// Number of rows to skip from the top of the entry.
     ///
@@ -33,8 +38,7 @@ pub struct EntryRenderer<'a> {
     /// scratch-buffer rendering of partially-visible entries.
     skip_rows: u16,
     /// Whether this entry's block is groupable (participates in dense groups).
-    /// When true AND display_mode == Collapsed, the accent char switches from
-    /// `┃` to the collapsed accent char (e.g., `❙`) with dimmed color.
+    /// When true AND display_mode == Collapsed, the bullet is dimmed.
     groupable: bool,
     /// Whether this entry is currently selected in the scrollback.
     is_selected: bool,
@@ -61,14 +65,13 @@ pub struct EntryRenderer<'a> {
     /// (code-block syntax shading, diff insert/delete rows) and the accent
     /// column are unaffected.
     flat_background: bool,
-    /// When true, suppress the left accent bar and **reclaim its column** for
-    /// content (chrome width drops by [`HorizontalLayout::ACCENT`]). Used by
-    /// minimal mode for a cleaner, flush-left look — the per-block `◆`/bullet
-    /// marker still reads the boundary between blocks, so the vertical accent
-    /// lines are just visual noise there. Paired with zeroed
-    /// `block_pad_{left,right}` in minimal's `committed_appearance`, content
-    /// starts at column 0 (aligned with the welcome card).
+    /// When true, reclaim the accent column for content (chrome width drops by [`HorizontalLayout::ACCENT`]).
+    /// Minimal mode pairs this with zeroed `block_pad_{left,right}`, so content starts at column 0, aligned with the welcome card.
     hide_accent: bool,
+    /// Paint the accent bar with [`Modifier::DIM`] on top of its color, so a
+    /// rail that resolved to `Color::Reset` reads as chrome rather than
+    /// full-brightness content.
+    dim_accent: bool,
     /// Session/worktree cwd (`AgentSession.cwd`) for Expanded tool paths.
     cwd: Option<&'a Path>,
 }
@@ -78,7 +81,7 @@ impl<'a> EntryRenderer<'a> {
         Self {
             entry,
             theme,
-            appearance: AppearanceConfig::default(),
+            appearance: OnceCell::new(),
             tick: 0,
             skip_rows: 0,
             groupable: false,
@@ -89,6 +92,7 @@ impl<'a> EntryRenderer<'a> {
             group_header_label: None,
             flat_background: false,
             hide_accent: false,
+            dim_accent: false,
             cwd: None,
         }
     }
@@ -105,10 +109,15 @@ impl<'a> EntryRenderer<'a> {
         self
     }
 
-    /// Suppress the left accent bar and reclaim its column (minimal mode's
-    /// flush-left look). See [`Self::hide_accent`].
+    /// Reclaim the accent column for content (minimal mode's flush-left look). See [`Self::hide_accent`].
     pub fn with_hide_accent(mut self, hide: bool) -> Self {
         self.hide_accent = hide;
+        self
+    }
+
+    /// See [`Self::dim_accent`]. Height-neutral — `chrome_width` is unchanged.
+    pub fn with_dim_accent(mut self, dim: bool) -> Self {
+        self.dim_accent = dim;
         self
     }
 
@@ -124,9 +133,41 @@ impl<'a> EntryRenderer<'a> {
         }
     }
 
+    /// The block's rail style, resolved through a full context so selection and width reach it.
+    fn accent(&self, content_width: u16) -> Option<AccentStyle> {
+        let mut ctx = self
+            .entry
+            .context(content_width, self.appearance(), self.cwd);
+        ctx.is_selected = self.is_selected;
+        self.entry.block.accent(&ctx)
+    }
+
+    /// Shared by every rail branch so it cannot be dim in one running state and bright in another.
+    fn accent_paint_style(&self, color: ratatui::style::Color) -> Style {
+        let style = Style::default().fg(color);
+        if self.dim_accent {
+            style.add_modifier(ratatui::style::Modifier::DIM)
+        } else {
+            style
+        }
+    }
+
     pub fn with_appearance(mut self, appearance: AppearanceConfig) -> Self {
-        self.appearance = appearance;
+        self.appearance = OnceCell::from(Cow::Owned(appearance));
         self
+    }
+
+    ///
+    /// Preferred inside the O(history) layout loops, which would otherwise
+    /// clone the config once per entry.
+    pub fn with_appearance_ref(mut self, appearance: &'a AppearanceConfig) -> Self {
+        self.appearance = OnceCell::from(Cow::Borrowed(appearance));
+        self
+    }
+
+    fn appearance(&self) -> &AppearanceConfig {
+        self.appearance
+            .get_or_init(|| Cow::Owned(AppearanceConfig::default()))
     }
 
     pub fn with_tick(mut self, tick: u64) -> Self {
@@ -144,10 +185,7 @@ impl<'a> EntryRenderer<'a> {
         self
     }
 
-    /// Mark this entry as groupable for accent rendering.
-    ///
-    /// When groupable AND collapsed, the accent char switches from `┃` to the
-    /// collapsed accent char (e.g., `❙`) with dimmed color.
+    /// Mark this entry as groupable, which dims its bullet when collapsed.
     pub fn with_groupable(mut self, groupable: bool) -> Self {
         self.groupable = groupable;
         self
@@ -197,7 +235,7 @@ impl<'a> EntryRenderer<'a> {
     fn render_group_header(&self, area: Rect, buf: &mut Buffer) {
         use crate::scrollback::state::verb_group::GroupHeaderLabel;
 
-        let layout_cfg = &self.appearance.scrollback.layout;
+        let layout_cfg = &self.appearance().scrollback.layout;
         let accent_w = if self.hide_accent {
             0
         } else {
@@ -211,75 +249,65 @@ impl<'a> EntryRenderer<'a> {
         ])
         .areas(area);
 
-        let display_cfg = &self.appearance.scrollback.display;
         let bg = self.theme.bg_base;
 
-        // Verb-group header: aggregated "Verb N noun" label with run-state
-        // accent (error > running wave > dimmed tool accent). The diamond
-        // shares the accent color, so an active group's glyph animates with
-        // the same wave as a running tool row's bullet.
+        // The column is reserved but never painted here, and an unowned cell survives the frame diff,
+        // so whatever glyph the previous frame left at this position would stay.
+        fill_bg_spaces(buf, accent_area, bg);
+
+        // Verb-group header: aggregated "Verb N noun" label whose diamond takes the run-state color, so an active group's glyph
+        // animates with the same wave as a running tool row's bullet.
         if let Some(GroupHeaderLabel::VerbRun(vg)) = self.group_header_label {
+            use unicode_width::UnicodeWidthStr;
+
             let glyph_color = if vg.failed {
-                let style = Style::default().fg(self.theme.accent_error);
-                buf.set_string_safe(
-                    accent_area.x,
-                    accent_area.y,
-                    crate::glyphs::accent_bar(),
-                    style,
-                );
                 self.theme.accent_error
             } else if vg.running {
                 let brightness = theme::wave_brightness(
                     self.tick,
                     self.skip_rows,
-                    self.appearance.animation.wave_rows,
+                    self.appearance().animation.wave_rows,
                     WAVE_SPEED,
                 );
-                let color = blend_color(bg, self.theme.accent_tool, brightness)
-                    .unwrap_or(self.theme.accent_tool);
-                buf.set_string_safe(
-                    accent_area.x,
-                    accent_area.y,
-                    crate::glyphs::accent_bar(),
-                    Style::default().fg(color),
-                );
-                color
+                blend_color(bg, self.theme.accent_tool, brightness)
+                    .unwrap_or(self.theme.accent_tool)
             } else {
-                let dimmed = blend_color(bg, self.theme.accent_tool, display_cfg.dim_accent)
-                    .unwrap_or(self.theme.accent_tool);
-                buf.set_string_safe(
-                    accent_area.x,
-                    accent_area.y,
-                    &display_cfg.collapsed_accent_char,
-                    Style::default().fg(dimmed),
-                );
                 self.theme.gray
             };
-            // Diamond chrome in BOTH states — same family as the "N more"
-            // headers. The selection caret (the expandable indicator in
-            // scrollback_pane.rs) overdraws the diamond on the selected row
-            // and flips `›`/`⌄` with the group's fold state.
+
+            // Diamond chrome in BOTH states, same family as the "N more" headers.
+            // The selection caret (the expandable indicator in scrollback_pane.rs) overdraws the diamond on
+            // the selected row and flips `›`/`⌄` with the group's fold state.
+            let prefix = group_header_chrome_prefix();
             let mut spans = vec![ratatui::text::Span::styled(
-                group_header_chrome_prefix(),
+                prefix.clone(),
                 Style::default().fg(glyph_color),
             )];
-            spans.extend(vg.line.spans.iter().cloned());
+            let hook_start = vg
+                .line
+                .spans
+                .iter()
+                .position(|span| span.content.starts_with("  [hooks: "));
+            if let Some(hook_start) = hook_start {
+                let suffix_width: usize = vg.line.spans[hook_start..]
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                    .sum();
+                let label_budget = usize::from(content_area.width)
+                    .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
+                    .saturating_sub(suffix_width);
+                let label = ratatui::text::Line::from(vg.line.spans[..hook_start].to_vec());
+                spans.extend(crate::render::line_utils::truncate_line(label, label_budget).spans);
+                spans.extend(vg.line.spans[hook_start..].iter().cloned());
+            } else {
+                spans.extend(vg.line.spans.iter().cloned());
+            }
             let line = ratatui::text::Line::from(spans);
-            buf.set_line_safe(content_area.x, content_area.y, &line, content_area.width);
+            // Group-header content is registered selectable (GROUP_HEADER_RANGE_ID)
+            // and its selection maps visual columns, so it must paint visual too.
+            buf.set_line_safe_bidi(content_area.x, content_area.y, &line, content_area.width);
             return;
         }
-
-        // Render dimmed accent char — use theme.accent_tool directly instead of
-        // going through self.accent() which creates a full BlockContext.
-        let accent_color = self.theme.accent_tool;
-        let dimmed = blend_color(bg, accent_color, display_cfg.dim_accent).unwrap_or(accent_color);
-        let style = Style::default().fg(dimmed);
-        buf.set_string_safe(
-            accent_area.x,
-            accent_area.y,
-            &display_cfg.collapsed_accent_char,
-            style,
-        );
 
         // Render header: ◈ (dimmed) + text (brighter, stands out). The
         // aggregated label describes the hidden rows through the shared
@@ -307,7 +335,9 @@ impl<'a> EntryRenderer<'a> {
             spans.push(ratatui::text::Span::styled(label, text_style));
         }
         let line = ratatui::text::Line::from(spans);
-        buf.set_line_safe(content_area.x, content_area.y, &line, content_area.width);
+        // Group-header content is registered selectable (GROUP_HEADER_RANGE_ID)
+        // and its selection maps visual columns, so it must paint visual too.
+        buf.set_line_safe_bidi(content_area.x, content_area.y, &line, content_area.width);
     }
 
     /// Get the chrome width (accent + padding) for this renderer's appearance.
@@ -315,8 +345,8 @@ impl<'a> EntryRenderer<'a> {
     /// When [`Self::hide_accent`] is set the accent column is reclaimed, so
     /// chrome is just the block pads (typically zeroed in minimal mode).
     pub fn chrome_width(&self) -> u16 {
-        let pads = self.appearance.scrollback.layout.block_pad_left
-            + self.appearance.scrollback.layout.block_pad_right;
+        let pads = self.appearance().scrollback.layout.block_pad_left
+            + self.appearance().scrollback.layout.block_pad_right;
         if self.hide_accent {
             pads
         } else {
@@ -345,19 +375,11 @@ impl<'a> EntryRenderer<'a> {
     /// When > 0, content is wrapped at `content_width - reserved` so text
     /// never collides with the timestamp overlay.
     fn timestamp_reserved(&self) -> u16 {
-        if self.appearance.show_timestamps && self.should_show_timestamp() {
+        if self.appearance().show_timestamps && self.should_show_timestamp() {
             10 // max short format: "  12:30 PM"
         } else {
             0
         }
-    }
-
-    fn accent(&self, content_width: u16) -> Option<AccentStyle> {
-        let mut ctx = self
-            .entry
-            .context(content_width, &self.appearance, self.cwd);
-        ctx.is_selected = self.is_selected;
-        self.entry.block.accent(&ctx)
     }
 
     /// Thinking entries take no rows when the Appearance toggle is off.
@@ -382,7 +404,7 @@ impl<'a> EntryRenderer<'a> {
             .saturating_sub(self.chrome_width())
             .saturating_sub(self.timestamp_reserved());
         self.entry
-            .ensure_truncated_height_cached(content_width, &self.appearance, self.cwd)
+            .ensure_truncated_height_cached(content_width, self.appearance(), self.cwd)
     }
 
     /// Extra rows to reserve for inline media preview (images/video poster).
@@ -443,10 +465,7 @@ impl<'a> EntryRenderer<'a> {
         {
             1
         } else {
-            match self.entry.block.searchable_text() {
-                Some(text) => estimate_wrapped_line_count(&text, content_width),
-                None => 1,
-            }
+            self.entry.estimate_source_lines(content_width)
         };
         self.entry.store_estimate_lines(content_width, lines);
         lines
@@ -457,10 +476,7 @@ impl<'a> EntryRenderer<'a> {
     /// ceiling can't overflow and corrupt `virtual_y` / `total_height`. Shared by
     /// `desired_height` and `estimate_height` so the assembly stays canonical.
     fn assemble_height(&self, content_width: u16, content_lines: u16) -> u16 {
-        let ctx = self
-            .entry
-            .context(content_width, &self.appearance, self.cwd);
-        let vpad: u16 = if self.entry.block.has_vpad(&ctx) {
+        let vpad: u16 = if self.entry.block.has_vpad_for(self.appearance()) {
             2
         } else {
             0
@@ -496,14 +512,14 @@ impl<'a> EntryRenderer<'a> {
         // `cached_output_ref` must come after it.
         let ctx = self
             .entry
-            .context(content_width, &self.appearance, self.cwd);
+            .context(content_width, self.appearance(), self.cwd);
         let vpad_top: u16 = if self.entry.block.has_vpad(&ctx) {
             1
         } else {
             0
         };
         self.entry
-            .ensure_cached(content_width, &self.appearance, false, self.cwd);
+            .ensure_cached(content_width, self.appearance(), false, self.cwd);
         let output = self.entry.cached_output_ref();
         let starts = output
             .lines
@@ -583,32 +599,6 @@ fn fill_bg_spaces(buf: &mut Buffer, rect: Rect, bg: ratatui::style::Color) {
     }
 }
 
-/// Estimate the wrapped line count for raw `text` at a given content width.
-///
-/// Uses DISPLAY width (`unicode_width`), not byte length. A deliberately cheap
-/// approximation: it ignores word boundaries and works from RAW source, so it may
-/// be larger or smaller than the exact rendered height. Correctness never relies
-/// on it — on-screen entries are always measured exactly.
-fn estimate_wrapped_line_count(text: &str, content_width: u16) -> u16 {
-    let cw = content_width.max(1) as usize;
-    // Renderers drop a single trailing newline; match that so trailing-`\n`
-    // source doesn't estimate one row too many.
-    let text = text.strip_suffix('\n').unwrap_or(text);
-    let mut total: usize = 0;
-    for line in text.split('\n') {
-        let display_width = unicode_width::UnicodeWidthStr::width(line);
-        total += if display_width == 0 {
-            1
-        } else {
-            display_width.div_ceil(cw)
-        };
-        if total >= u16::MAX as usize {
-            return u16::MAX;
-        }
-    }
-    total.max(1) as u16
-}
-
 impl Renderable for EntryRenderer<'_> {
     fn desired_height(&self, width: u16) -> u16 {
         if self.thinking_hidden() {
@@ -621,7 +611,7 @@ impl Renderable for EntryRenderer<'_> {
         // affects styling (e.g., UserPrompt prefix color), not line count, so
         // the non-selected cached output gives the correct height.
         self.entry
-            .ensure_cached(content_width, &self.appearance, false, self.cwd);
+            .ensure_cached(content_width, self.appearance(), false, self.cwd);
         // Clamp the line count: a pathologically large block could exceed u16.
         let content_lines = self.entry.cached_output_ref().len().min(u16::MAX as usize) as u16;
         self.assemble_height(content_width, content_lines)
@@ -663,7 +653,7 @@ impl Renderable for EntryRenderer<'_> {
             (area, self.skip_rows)
         };
 
-        let layout_cfg = &self.appearance.scrollback.layout;
+        let layout_cfg = &self.appearance().scrollback.layout;
         // Minimal (`hide_accent`): reclaim the accent column so content is
         // flush-left. Fullscreen keeps the 1-col gutter even when a block has
         // no painted accent (so columns stay aligned across entry types).
@@ -686,7 +676,7 @@ impl Renderable for EntryRenderer<'_> {
         // for edit blocks) that was previously thrown away.
         let mut ctx = self
             .entry
-            .context(content_area.width, &self.appearance, self.cwd);
+            .context(content_area.width, self.appearance(), self.cwd);
         ctx.is_selected = self.is_selected;
         // Minimal mode blends committed/tail blocks with the real terminal
         // background; suppress the block's own band (keeps accents + per-line
@@ -750,12 +740,8 @@ impl Renderable for EntryRenderer<'_> {
             }
         }
 
-        // Render accent line based on accent style.
-        // When skip_rows > 0, offset the wave phase so animation stays correct.
-        //
-        // Groupable + collapsed blocks use the collapsed accent char (e.g., "❙")
-        // with dimmed color to prevent adjacent accents from merging visually.
-        // Check if this entry recently finished and should flash its accent.
+        // Briefly flashed when a tool call or thinking block finishes. Read/Search/Edit carry no accent
+        // of their own, so the flash falls back to green.
         let recently_finished = !self.entry.is_running
             && self.entry.finished_at.is_some_and(|t| {
                 t.elapsed().as_millis() < crate::scrollback::state::FINISH_FLASH_DURATION_MS as u128
@@ -765,83 +751,51 @@ impl Renderable for EntryRenderer<'_> {
                 RenderBlock::ToolCall(_) | RenderBlock::Thinking(_)
             );
 
-        let accent = if self.hide_accent {
-            // Minimal mode: no left accent bar; column reclaimed (accent_w = 0).
-            None
-        } else if recently_finished {
-            // Flash: show a static accent in a visible color.
-            // Tool calls like Read/Search/Edit normally have no accent,
-            // so fall back to accent_success (green) for the flash.
-            // Thinking blocks use their natural purple accent.
-            let color = self
-                .entry
-                .block
-                .accent_color()
-                .unwrap_or(self.theme.accent_success);
-            Some(AccentStyle::static_color(color))
-        } else {
-            self.accent(content_area.width)
-        };
-        let has_hook_lines = self
-            .entry
-            .hook_data
-            .as_ref()
-            .is_some_and(|hd| hd.has_content());
-        let use_collapsed_accent =
-            self.groupable && self.entry.display_mode == DisplayMode::Collapsed && !has_hook_lines;
-        let display_cfg = &self.appearance.scrollback.display;
+        // A collapsed row is a one-line summary, so a rail beside it is noise, flash included. Truncated
+        // counts as open: it shows real content, and thinking blocks rest in that state.
+        let accent = (!self.hide_accent && self.entry.display_mode != DisplayMode::Collapsed)
+            .then(|| {
+                if recently_finished {
+                    let color = self
+                        .entry
+                        .block
+                        .accent_color()
+                        .unwrap_or(self.theme.accent_success);
+                    Some(AccentStyle::static_color(color))
+                } else {
+                    self.accent(content_area.width)
+                }
+            })
+            .flatten();
 
+        // The column stays reserved either way, so nothing reflows. Clear it or a previous frame bleeds through.
         if accent.is_none() {
-            // No accent: clear the accent column so stale content from
-            // previous frames doesn't bleed through. Use the block's bg
-            // (if any) so the column matches the rest of the entry.
             fill_bg_spaces(buf, accent_area, bg_color.unwrap_or(self.fallback_bg()));
         }
 
         if let Some(accent_style) = accent {
             let color = accent_style.color;
-            let is_pending = self.entry.is_pending_user_input;
 
-            if is_pending && accent_style.animated {
-                // Pending user input: freeze the running wave. A solid
-                // accent at full color reads as "paused on you" without
-                // the loading-spinner motion.
-                let style = Style::default().fg(color);
+            if self.entry.is_pending_user_input && accent_style.animated {
+                // Pending user input freezes the wave: a solid rail reads as "paused on you" without the spinner motion.
+                let style = self.accent_paint_style(color);
                 for y in accent_area.y..accent_area.y + accent_area.height {
                     buf.set_string_safe(accent_area.x, y, crate::glyphs::accent_bar(), style);
                 }
             } else if accent_style.animated {
-                // Animated accents: wave effect (running blocks)
                 let bg = bg_color.unwrap_or(self.fallback_bg());
-                let wave_rows = self.appearance.animation.wave_rows;
+                let wave_rows = self.appearance().animation.wave_rows;
 
                 for row in 0..accent_area.height {
                     let y = accent_area.y + row;
-                    let logical_row = skip_rows + row;
                     let brightness =
-                        theme::wave_brightness(self.tick, logical_row, wave_rows, WAVE_SPEED);
+                        theme::wave_brightness(self.tick, skip_rows + row, wave_rows, WAVE_SPEED);
                     let animated_color = blend_color(bg, color, brightness).unwrap_or(color);
-                    let style = Style::default().fg(animated_color);
+                    let style = self.accent_paint_style(animated_color);
                     buf.set_string_safe(accent_area.x, y, crate::glyphs::accent_bar(), style);
                 }
-            } else if use_collapsed_accent && !self.is_selected {
-                // Dimmed collapsed accent: thin char + blended color.
-                // When the entry is selected, fall through to the static
-                // full-color branch so the selection reads as undimmed.
-                let bg = bg_color.unwrap_or(self.fallback_bg());
-                let dimmed = blend_color(bg, color, display_cfg.dim_accent).unwrap_or(color);
-                let style = Style::default().fg(dimmed);
-                for y in accent_area.y..accent_area.y + accent_area.height {
-                    buf.set_string_safe(
-                        accent_area.x,
-                        y,
-                        &display_cfg.collapsed_accent_char,
-                        style,
-                    );
-                }
             } else {
-                // Static accent: full color
-                let style = Style::default().fg(color);
+                let style = self.accent_paint_style(color);
                 for y in accent_area.y..accent_area.y + accent_area.height {
                     buf.set_string_safe(accent_area.x, y, crate::glyphs::accent_bar(), style);
                 }
@@ -855,7 +809,7 @@ impl Renderable for EntryRenderer<'_> {
         let ts_reserved = self.timestamp_reserved();
         let text_width = content_area.width.saturating_sub(ts_reserved);
         self.entry
-            .ensure_cached(text_width, &self.appearance, self.is_selected, self.cwd);
+            .ensure_cached(text_width, self.appearance(), self.is_selected, self.cwd);
         let cached_ref = self.entry.cached_output_ref();
         let output: &BlockOutput = &cached_ref;
         let has_vpad = self.entry.block.has_vpad(&ctx);
@@ -910,7 +864,7 @@ impl Renderable for EntryRenderer<'_> {
                 }
             }
 
-            buf.set_line_safe(content_area.x, row, &line.content, content_area.width);
+            buf.set_line_safe_bidi(content_area.x, row, &line.content, content_area.width);
 
             if own_gutter {
                 let gutter = Rect::new(content_area.x + text_width, row, ts_reserved, 1);
@@ -924,7 +878,7 @@ impl Renderable for EntryRenderer<'_> {
         // Short format (h:mm AM/PM) by default; expands to full format
         // (HH:mm:ss | MMM DD) when the mouse hovers over the timestamp area.
         // Gated on appearance.show_timestamps (toggled via /timestamps).
-        if self.appearance.show_timestamps
+        if self.appearance().show_timestamps
             && content_skip == 0
             && !output.is_empty()
             && self.should_show_timestamp()
@@ -986,7 +940,7 @@ impl Renderable for EntryRenderer<'_> {
                 if style.animated {
                     // Animated bullet: wave effect synced with accent
                     let bg = bg_color.unwrap_or(self.fallback_bg());
-                    let wave_rows = self.appearance.animation.wave_rows;
+                    let wave_rows = self.appearance().animation.wave_rows;
                     let brightness = theme::wave_brightness(self.tick, 0, wave_rows, WAVE_SPEED);
                     let animated_color =
                         blend_color(bg, style.color, brightness).unwrap_or(style.color);
@@ -1001,8 +955,8 @@ impl Renderable for EntryRenderer<'_> {
                     // When selected, keep the bullet at its original full
                     // color so the selection reads as undimmed.
                     let bg = bg_color.unwrap_or(self.fallback_bg());
-                    let dimmed =
-                        blend_color(bg, style.color, display_cfg.dim_accent).unwrap_or(style.color);
+                    let dim = self.appearance().scrollback.display.dim_accent;
+                    let dimmed = blend_color(bg, style.color, dim).unwrap_or(style.color);
                     if let Some(cell) = buf.cell_mut((content_area.x, bullet_y)) {
                         cell.fg = dimmed;
                     }
@@ -1061,6 +1015,25 @@ mod tests {
         );
     }
 
+    /// A collapsed row drops the rail and keeps the column, so content must not shift with it.
+    #[test]
+    fn a_collapsed_entry_drops_the_rail_but_keeps_the_column() {
+        let theme = Theme::current();
+        let entry = ScrollbackEntry::new(RenderBlock::stub("Test", Color::Blue))
+            .with_display_mode(DisplayMode::Collapsed);
+
+        let area = Rect::new(0, 0, 20, 3);
+        let mut buf = Buffer::empty(area);
+        EntryRenderer::new(&entry, &theme).render(area, &mut buf);
+
+        assert_eq!(buf.cell((0, 1)).unwrap().symbol(), " ", "no rail");
+        assert_eq!(
+            buf.cell((3, 1)).unwrap().symbol(),
+            "T",
+            "content must not reflow"
+        );
+    }
+
     #[test]
     fn test_entry_renderer_layout() {
         let theme = Theme::current();
@@ -1073,7 +1046,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         renderer.render(area, &mut buf);
 
-        // Accent at column 0
+        // A stub is Expanded, so it keeps its rail. Collapsed rows are the ones that go bare.
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "┃");
         assert_eq!(buf.cell((0, 1)).unwrap().symbol(), "┃");
         assert_eq!(buf.cell((0, 2)).unwrap().symbol(), "┃");
@@ -1166,7 +1139,7 @@ mod tests {
     /// for `width`, derived from the renderer geometry so tests self-adjust to
     /// the default layout padding instead of hard-coding column numbers.
     fn gutter_band(renderer: &EntryRenderer, width: u16) -> std::ops::Range<u16> {
-        let content_right = width - renderer.appearance.scrollback.layout.block_pad_right;
+        let content_right = width - renderer.appearance().scrollback.layout.block_pad_right;
         (content_right - renderer.timestamp_reserved())..content_right
     }
 
@@ -1192,7 +1165,7 @@ mod tests {
         renderer.render(area, &mut buf);
 
         // UserPrompt has vpad=true, first content row is y=1.
-        let expected = chrono::Local::now().format("%-I:%M %p").to_string();
+        let expected = entry.created_at.unwrap().format("%-I:%M %p").to_string();
         let ts_width = expected.len() as u16;
         let ts_x = width - 2 - ts_width;
         let content_row = 1u16;
@@ -1217,7 +1190,7 @@ mod tests {
         renderer.render(area, &mut buf);
 
         // AgentMessage has vpad=false, first content row is y=0.
-        let expected = chrono::Local::now().format("%-I:%M %p").to_string();
+        let expected = entry.created_at.unwrap().format("%-I:%M %p").to_string();
         let ts_width = expected.len() as u16;
         let ts_x = width - 2 - ts_width;
 
@@ -1244,7 +1217,14 @@ mod tests {
         let mut buf = Buffer::empty(area);
         renderer.render(area, &mut buf);
 
-        let expected = chrono::Local::now().format("%H:%M:%S | %b %d").to_string();
+        // Compare against the entry's captured timestamp, not a fresh
+        // Local::now() — re-sampling the clock here races the second boundary
+        // (%H:%M:%S) and made this test flaky.
+        let expected = entry
+            .created_at
+            .unwrap()
+            .format("%H:%M:%S | %b %d")
+            .to_string();
         let ts_width = expected.len() as u16;
         let ts_x = width - 2 - ts_width;
 
@@ -1471,7 +1451,7 @@ mod tests {
         renderer.render(area, &mut buf);
 
         // AgentMessage has no vpad → first content row is y=0.
-        let expected = chrono::Local::now().format("%-I:%M %p").to_string();
+        let expected = entry.created_at.unwrap().format("%-I:%M %p").to_string();
         let ts_width = expected.len() as u16;
         let ts_x = width - 2 - ts_width;
         let rendered = collect_row_symbols(&buf, 0, ts_x, ts_x + ts_width);
@@ -1539,7 +1519,7 @@ mod tests {
         let height = renderer.desired_height(width);
         let area = Rect::new(0, 0, width, height);
         let content_left =
-            HorizontalLayout::ACCENT + renderer.appearance.scrollback.layout.block_pad_left;
+            HorizontalLayout::ACCENT + renderer.appearance().scrollback.layout.block_pad_left;
         let ghost_x = gutter_band(&renderer, width).start + 2;
 
         // Clean render: find the code row by its token, capture its background.
@@ -1730,8 +1710,8 @@ mod tests {
     #[test]
     fn estimate_wrapped_line_count_saturates_at_u16_max() {
         // > u16::MAX source lines must cap, not overflow the running total.
-        let many = "\n".repeat(70_000);
-        assert_eq!(estimate_wrapped_line_count(&many, 80), u16::MAX);
+        let entry = ScrollbackEntry::new(RenderBlock::user_prompt("\n".repeat(70_000)));
+        assert_eq!(entry.estimate_source_lines(80), u16::MAX);
     }
 
     #[test]

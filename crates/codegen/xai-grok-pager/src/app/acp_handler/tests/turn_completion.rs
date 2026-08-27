@@ -231,7 +231,7 @@
     }
 
     #[test]
-    fn wake_turn_completed_is_markerless() {
+    fn silent_wake_turn_completed_is_markerless() {
         let mut app = make_app_with_agent("sess-wake");
         seed_two_bg_tasks(&mut app, "sess-wake");
         let len_before = app.agents[&AgentId(0)].scrollback.len();
@@ -254,7 +254,7 @@
         assert_eq!(
             agent.scrollback.len(),
             len_before,
-            "a completed wake turn pushes no marker"
+            "a silent wake turn pushes no marker"
         );
         assert_eq!(
             agent.watchers().commands,
@@ -264,11 +264,141 @@
     }
 
     #[test]
+    fn chatty_wake_turn_completed_pushes_one_marker() {
+        use crate::app::agent_view::test_fixtures::count_turn_markers;
+
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        assert_eq!(count_turn_markers(&app.agents[&AgentId(0)]), 0);
+
+        let affected = handle_ext_notification(
+            &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg1", None),
+            &mut app,
+        );
+        assert!(affected);
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            count_turn_markers(agent),
+            1,
+            "a chatty wake closes with exactly one marker"
+        );
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnCompleted { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_wake_terminal_pushes_no_second_marker() {
+        // `finish_wake_turn` snapshots the output epoch, so a duplicate sees no new output.
+        use crate::app::agent_view::test_fixtures::count_turn_markers;
+
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg1", None),
+            &mut app,
+        );
+        assert_eq!(count_turn_markers(&app.agents[&AgentId(0)]), 1);
+
+        let _ = handle_ext_notification(
+            &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg1", None),
+            &mut app,
+        );
+        assert_eq!(
+            count_turn_markers(&app.agents[&AgentId(0)]),
+            1,
+            "a duplicate wake terminal must not push a second marker"
+        );
+    }
+
+    #[test]
+    fn wake_turn_stop_affordance_offered_then_cleared_at_terminal() {
+        // The pane stays Idle around a wake turn, so the stop affordance is
+        // keyed on `running_wake_turn`: set by the first live wake delta,
+        // cleared by the wake terminal.
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(
+            matches!(agent.wake_display_state(), Some(AgentState::TurnRunning)),
+            "a streaming wake turn must offer the running chrome (and [stop])"
+        );
+
+        // A delta arriving mid-cancel must not reset the cancelling phase.
+        if let Some(wake) = app
+            .agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .running_wake_turn
+            .as_mut()
+        {
+            wake.cancel_sent = true;
+        }
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 6_000),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(
+            matches!(agent.wake_display_state(), Some(AgentState::TurnCancelling)),
+            "a later delta must not clobber the cancelling phase"
+        );
+
+        let _ = handle_ext_notification(
+            &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg1", None),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(
+            agent.running_wake_turn.is_none() && agent.wake_display_state().is_none(),
+            "the wake terminal must retire the stop affordance"
+        );
+
+        // Deltas and the terminal ride separate channels: a late delta for
+        // the finished wake must not revive the affordance.
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 7_000),
+            &mut app,
+        );
+        assert!(
+            app.agents[&AgentId(0)].running_wake_turn.is_none(),
+            "a late delta after the terminal must not revive the stop affordance"
+        );
+
+        // A second wake finishing must not forget the first: bg1's late
+        // delta stays dead after bg2's terminal lands too.
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg2", 8_000),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg2", None),
+            &mut app,
+        );
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 9_000),
+            &mut app,
+        );
+        assert!(
+            app.agents[&AgentId(0)].running_wake_turn.is_none(),
+            "an earlier finished wake stays finished after later terminals"
+        );
+    }
+
+    #[test]
     fn wake_terminal_finishes_in_flight_streamed_entry() {
-        // A wake turn streams its response, then its terminal lands: the
-        // terminal is the ONLY flush site (wake turns skip PromptResponse),
-        // so the streamed entry must be finished — not left spinning until
-        // the next turn's stream start. Dead wakes take the same path.
+        // The terminal is a wake's ONLY flush site (wakes skip PromptResponse).
         let mut app = make_app_with_agent("sess-wake");
         let _ = handle(
             make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
@@ -290,20 +420,27 @@
     }
 
     #[test]
-    fn wake_turn_completed_in_replay_only_records_pid() {
-        // The replay arm is untouched: a wake pid seen during a load's replay
-        // records adoption state and pushes nothing (markers are client-local
-        // and never replayed).
+    fn wake_turn_completed_in_replay_records_pid_and_visible_marker() {
+        // A visible wake still records its pid and now also gets a marker.
+        // The chunk must be isReplay — live output_epoch does not count.
         let mut app = make_app_with_agent("sess-wake");
-        app.agents
-            .get_mut(&AgentId(0))
-            .unwrap()
-            .session
-            .loading_replay = true;
+        begin_replay(&mut app);
+        let _ = handle(
+            make_replay_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
         let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let started_at = app.agents[&AgentId(0)].turn_started_at;
 
         let affected = handle_ext_notification(
-            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "end_turn", true),
+            &xai_turn_completed_replay(
+                "sess-wake",
+                "task-completed-bg1",
+                "end_turn",
+                Some(1500),
+                None,
+                serde_json::json!({}),
+            ),
             &mut app,
         );
 
@@ -315,18 +452,17 @@
                 .contains("task-completed-bg1"),
             "the replay arm must keep recording wake pids"
         );
-        assert_eq!(
-            agent.scrollback.len(),
-            len_before,
-            "no marker during replay"
-        );
+        assert_eq!(agent.scrollback.len(), len_before + 1);
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnCompleted { elapsed: Some(_) })
+        ));
+        assert_eq!(agent.turn_started_at, started_at, "replay must not finalize");
     }
 
     #[test]
     fn scheduler_fired_turn_completed_keeps_adopted_path() {
-        // `/loop` turns are synthetic but CLIENT-driven with a real finalize
-        // path — they must not take the wake-marker shortcut. Idle driver +
-        // scheduler pid → the shared finalize ignores it, no marker.
+        // `/loop` turns are client-driven with a real finalize path — never the wake shortcut.
         let mut app = make_app_with_agent("sess-cron");
         let len_before = app.agents[&AgentId(0)].scrollback.len();
 
@@ -344,14 +480,325 @@
     }
 
     #[test]
-    fn failed_wake_turn_keeps_markerless_shape() {
-        // "Worked for" would lie about an errored/cancelled wake turn, and
-        // the cancel/failure UX is driver-side context this signal lacks —
-        // those stop reasons keep today's markerless shape.
+    fn silent_errored_wake_pushes_failure_marker() {
+        // Failures surface even when invisible: the standing instruction silently stopped.
         let mut app = make_app_with_agent("sess-wake");
         let len_before = app.agents[&AgentId(0)].scrollback.len();
 
-        for stop_reason in ["error", "cancelled", "rate_limit"] {
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(agent.scrollback.len(), len_before + 1);
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn rate_limited_wake_during_local_turn_keeps_rate_limit_copy() {
+        // The busy-wake piercing path must pass rate-limit copy through
+        // untouched like `finish_wake_turn` does — the generic formatter
+        // would strip the upgrade URL and headline it "Request failed".
+        let mut app = make_app_with_agent("sess-wake");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent.session.state = AgentState::TurnRunning;
+        }
+        let rate_limit_copy = "You've hit the rate limit for your plan. Upgrade your \
+                               subscription for higher limits: https://grok.com/supergrok";
+        let payload = SessionNotification {
+            session_id: acp::SessionId::new("sess-wake"),
+            update: XaiSessionUpdate::TurnCompleted {
+                prompt_id: "task-completed-bg1".into(),
+                stop_reason: "rate_limit".into(),
+                agent_result: Some(rate_limit_copy.into()),
+                usage: None,
+                elapsed_ms: None,
+            },
+            meta: Some(serde_json::json!({ "isReplay": false })),
+        };
+        let notif = acp::ExtNotification::new(
+            "x.ai/session/update",
+            std::sync::Arc::from(serde_json::value::to_raw_value(&payload).unwrap()),
+        );
+
+        let _ = handle_ext_notification(&notif, &mut app);
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        match last_session_event(&agent.scrollback) {
+            Some(SessionEvent::TurnFailed { error, .. }) => {
+                assert_eq!(error, rate_limit_copy, "copy must pass through untouched");
+            }
+            other => panic!("expected TurnFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn errored_wake_skips_marker_when_banner_already_on_screen() {
+        // The retry-state rail already pushed the formatted RequestFailed
+        // banner for this failure; the wake rail must not add a second
+        // near-identical warning line — same dedupe as the local rails.
+        let mut app = make_app_with_agent("sess-wake");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent
+                .scrollback
+                .push_block(crate::scrollback::block::RenderBlock::session_event(
+                    SessionEvent::RequestFailed {
+                        status: Some(400),
+                        headline: "Bad request (400)".into(),
+                        detail: "The server rejected this request.".into(),
+                    },
+                ));
+        }
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent.scrollback.len(),
+            len_before,
+            "banner already covers the failure; no TurnFailed marker"
+        );
+        // The failure is still recorded, so the other wake rail stays quiet too.
+        assert_eq!(
+            agent.failed_wake_marker_for.as_deref(),
+            Some("task-completed-bg1")
+        );
+    }
+
+    /// Same dedupe on the busy-wake rail (a local turn is running, so the
+    /// terminal takes the `is_busy` branch instead of `finish_wake_turn`).
+    #[test]
+    fn errored_wake_during_local_turn_skips_marker_when_banner_on_screen() {
+        use crate::app::agent::AgentState;
+
+        let mut app = make_app_with_agent("sess-wake");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent.session.state = AgentState::TurnRunning;
+            agent
+                .scrollback
+                .push_block(crate::scrollback::block::RenderBlock::session_event(
+                    SessionEvent::RequestFailed {
+                        status: Some(500),
+                        headline: "Server error (500)".into(),
+                        detail: String::new(),
+                    },
+                ));
+        }
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent.scrollback.len(),
+            len_before,
+            "banner already covers the failure; no TurnFailed marker"
+        );
+        assert_eq!(
+            agent.failed_wake_marker_for.as_deref(),
+            Some("task-completed-bg1")
+        );
+    }
+
+    #[test]
+    fn silent_errored_wake_ignores_stale_turn_start_ms() {
+        // A silent wake streamed no deltas, so the stored `turn_start_ms` is an earlier turn's.
+        let mut app = make_app_with_agent("sess-wake");
+        app.agents.get_mut(&AgentId(0)).unwrap().turn_start_ms =
+            Some(chrono::Utc::now().timestamp_millis() - 600_000);
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { elapsed: None, .. })
+        ));
+    }
+
+    #[test]
+    fn goal_terminal_snapshots_epoch_so_next_silent_wake_stays_markerless() {
+        // A dirty output epoch made the NEXT silent wake inherit the goal turn's output.
+        use crate::app::agent_view::test_fixtures::count_turn_markers;
+
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "goal-summary-g1", 5_000),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "goal-summary-g1", "end_turn", false),
+            &mut app,
+        );
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "end_turn", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent.scrollback.len(),
+            len_before,
+            "a silent wake after a goal turn must not inherit its output"
+        );
+        assert_eq!(count_turn_markers(agent), 0);
+    }
+
+    #[test]
+    fn errored_wake_terminal_during_local_turn_still_pushes_failure() {
+        // Failure visibility survives the busy skip: no tracker finish, no
+        // elapsed (the anchor is the local turn's), but the row must land.
+        use crate::app::agent::AgentState;
+
+        let mut app = make_app_with_agent("sess-wake");
+        app.agents.get_mut(&AgentId(0)).unwrap().session.state = AgentState::TurnRunning;
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        for _ in 0..2 {
+            let _ = handle_ext_notification(
+                &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+                &mut app,
+            );
+        }
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(agent.scrollback.len(), len_before + 1, "one row, deduped");
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { elapsed: None, .. })
+        ));
+    }
+
+    #[test]
+    fn wake_terminal_during_command_snapshots_epoch_for_next_silent_wake() {
+        // A client command (e.g. /compact) skips the wake finish but must not
+        // leave the epoch dirty: the next silent wake would claim the skipped
+        // wake's output.
+        use crate::app::agent::{AgentCommand, AgentState};
+        use crate::app::agent_view::test_fixtures::count_turn_markers;
+
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        app.agents.get_mut(&AgentId(0)).unwrap().session.state = AgentState::CommandRunning {
+            command: AgentCommand::Compact,
+            started_at: std::time::Instant::now(),
+        };
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "end_turn", false),
+            &mut app,
+        );
+        app.agents.get_mut(&AgentId(0)).unwrap().session.state = AgentState::Idle;
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg2", "end_turn", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent.scrollback.len(),
+            len_before,
+            "silent wake after a command-skipped terminal must stay markerless"
+        );
+        assert_eq!(count_turn_markers(agent), 0);
+    }
+
+    #[test]
+    fn chatty_wake_with_foreign_turn_start_anchor_omits_elapsed() {
+        // `turn_start_ms` stamped by another prompt's deltas must not become
+        // this wake's elapsed.
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 600_000),
+            &mut app,
+        );
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg2", "end_turn", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnCompleted { elapsed: None })
+        ));
+    }
+
+    #[test]
+    fn silent_errored_wake_after_goal_turn_has_no_elapsed() {
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "goal-summary-g1", 5_000),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "goal-summary-g1", "end_turn", false),
+            &mut app,
+        );
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { elapsed: None, .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_errored_wake_terminal_pushes_one_failure_marker() {
+        // Failures bypass the output-epoch dedupe, so duplicates are deduped by prompt id.
+        let mut app = make_app_with_agent("sess-wake");
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        for _ in 0..2 {
+            let _ = handle_ext_notification(
+                &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+                &mut app,
+            );
+        }
+
+        assert_eq!(
+            app.agents[&AgentId(0)].scrollback.len(),
+            len_before + 1,
+            "one failure marker for the wake, duplicates dropped"
+        );
+    }
+
+    #[test]
+    fn silent_cancelled_or_rate_limited_wake_stays_markerless() {
+        // Rate limits ride the retry notifications instead, matching the real-turn rails.
+        let mut app = make_app_with_agent("sess-wake");
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        for stop_reason in ["cancelled", "rate_limit"] {
             let _ = handle_ext_notification(
                 &xai_turn_completed_notif("sess-wake", "task-completed-bg1", stop_reason, false),
                 &mut app,
@@ -361,8 +808,139 @@
         assert_eq!(
             app.agents[&AgentId(0)].scrollback.len(),
             len_before,
-            "non-completion wake terminals push nothing"
+            "cancelled/rate-limited silent wake terminals push nothing"
         );
+    }
+
+    #[test]
+    fn chatty_send_now_cancelled_wake_is_markerless() {
+        // A wake with output cancelled by send-now must stay silent — same
+        // suppression the other three turn-end rails already apply.
+        use crate::app::agent_view::test_fixtures::count_turn_markers;
+
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif_with_cancel_trigger(
+                "sess-wake",
+                "task-completed-bg1",
+                "cancelled",
+                "send_now",
+            ),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent.scrollback.len(),
+            len_before,
+            "a send-now cancelled chatty wake must push no marker"
+        );
+        assert_eq!(count_turn_markers(agent), 0);
+        assert!(
+            !matches!(
+                last_session_event(&agent.scrollback),
+                Some(SessionEvent::TurnCancelled { .. })
+            ),
+            "send_now must not surface as Turn cancelled by user"
+        );
+    }
+
+    #[test]
+    fn chatty_user_cancelled_wake_pushes_cancelled_marker() {
+        // Genuine cancel (Ctrl+C / Esc, no wire trigger) still shows the marker.
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "cancelled", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnCancelled { .. })
+        ));
+    }
+
+    #[test]
+    fn foreign_send_now_arm_does_not_suppress_wake_cancel_marker() {
+        // A flag armed for a different (user) prompt must not eat this wake's
+        // genuine cancel marker, and must stay armed after close-out.
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .expect_send_now_cancel = Some("user-prompt-other".into());
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "cancelled", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnCancelled { .. })
+        ));
+        assert_eq!(
+            agent.expect_send_now_cancel.as_deref(),
+            Some("user-prompt-other"),
+            "wake close-out must not clear a foreign send-now arm"
+        );
+    }
+
+    #[test]
+    fn chatty_rate_limited_wake_closes_with_failure_marker() {
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "rate_limit", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn chatty_errored_wake_pushes_failure_marker_not_worked_for() {
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { .. })
+        ));
     }
 
     #[test]
@@ -395,11 +973,8 @@
 
     #[test]
     fn wake_terminal_during_local_turn_pushes_nothing() {
-        // Wire interleave: wake turn W streams (pager idle), the user sends a
-        // prompt locally (TurnRunning), then FIFO delivers W's terminal
-        // before the new turn's deltas. A foreign "Worked for" under the
-        // fresh prompt would misattribute — the local turn pushes its own
-        // marker when it ends.
+        // FIFO can deliver a wake's terminal after a fresh local prompt starts; a
+        // foreign "Worked for" under that prompt would misattribute.
         let mut app = make_app_with_agent("sess-wake");
         seed_two_bg_tasks(&mut app, "sess-wake");
         {
@@ -429,10 +1004,6 @@
 
     #[test]
     fn wake_terminal_leaves_real_turn_stash_pending() {
-        // Stop-hook stash semantics belong to real turns: a stash stamped
-        // with a REAL turn's pid must survive a wake turn's (markerless)
-        // terminal untouched — no fold, no standalone flush — and wait for
-        // its own marker rail.
         use crate::scrollback::blocks::tool::{HookRunEntry, HookRunStatus};
         let mut app = make_app_with_agent("sess-wake");
         {
@@ -505,9 +1076,8 @@
 
     #[test]
     fn replayed_stop_hooks_render_as_standalone_block() {
-        // Replay keeps the legacy standalone block: turn markers are
-        // client-local and not reconstructed from the persisted stream,
-        // so there is nothing to merge into on resume.
+        // Replay keeps stop hooks standalone: the reconstructed marker is
+        // pushed with empty hook groups and must not fold the stash.
         let mut app = make_app_with_agent("sess-replay");
         app.agents
             .get_mut(&AgentId(0))
@@ -527,6 +1097,69 @@
             "replayed stop hooks keep the standalone lifecycle block"
         );
         assert!(agent.pending_stop_hooks.is_none());
+    }
+
+    /// The wire `blocked` flag splits a failed run: a stop-gate block maps to
+    /// `HookRunStatus::Blocked` (a decision, not a failure), a plain failure stays `Failed`.
+    #[test]
+    fn blocked_wire_flag_maps_to_blocked_status() {
+        use crate::scrollback::blocks::tool::HookRunStatus;
+        use xai_grok_shell::extensions::notification::{HookRunEntryDto, HookRunStatusDto};
+
+        let mut app = make_app_with_agent("sess-blocked");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent.session.start_turn(&mut agent.scrollback);
+            agent.session.current_prompt_id = Some("pid-1".into());
+        }
+
+        let _ = handle_ext_notification(
+            &xai_hook_execution_notif_with_runs(
+                "sess-blocked",
+                "stop",
+                Some("pid-1"),
+                false,
+                vec![
+                    HookRunEntryDto {
+                        name: "gate".into(),
+                        status: HookRunStatusDto::Failed {
+                            error: "blocked stop: run the tests".into(),
+                            elapsed_ms: 7,
+                            blocked: true,
+                        },
+                        output: None,
+                    },
+                    HookRunEntryDto {
+                        name: "broken".into(),
+                        status: HookRunStatusDto::Failed {
+                            error: "exit code 1".into(),
+                            elapsed_ms: 3,
+                            blocked: false,
+                        },
+                        output: None,
+                    },
+                ],
+            ),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let pending = agent
+            .pending_stop_hooks
+            .as_ref()
+            .expect("stop hooks must be stashed for the marker");
+        let runs = &pending.groups[0].1;
+        assert!(
+            matches!(&runs[0].status, HookRunStatus::Blocked { detail, .. }
+                if detail == "blocked stop: run the tests"),
+            "blocked: true must map to Blocked, got {:?}",
+            runs[0].status
+        );
+        assert!(
+            matches!(&runs[1].status, HookRunStatus::Failed { .. }),
+            "blocked: false must stay Failed, got {:?}",
+            runs[1].status
+        );
     }
 
     #[test]
@@ -623,6 +1256,49 @@
             "a foreign-pid batch must not merge into another turn's marker"
         );
         assert_eq!(count_lifecycle_blocks(&agent.scrollback), 1);
+    }
+
+    #[test]
+    fn stop_cancelled_hooks_fold_into_the_cancelled_marker() {
+        // The report is dispatched off the command loop, so it races the terminal in both
+        // directions: the terminal first folds onto an existing marker, the batch first stashes.
+        for terminal_first in [true, false] {
+            let mut app = make_app_with_agent("sess-cancelled-hooks");
+            app.agents.get_mut(&AgentId(0)).unwrap().attached_as_viewer = true;
+            let _ = handle(
+                make_agent_chunk_message_with_prompt(
+                    "sess-cancelled-hooks",
+                    "chunk",
+                    "pid-c",
+                    false,
+                ),
+                &mut app,
+            );
+            let terminal =
+                xai_turn_completed_notif("sess-cancelled-hooks", "pid-c", "cancelled", false);
+            let batch = xai_hook_execution_notif_for_prompt(
+                "sess-cancelled-hooks",
+                "stop_cancelled",
+                Some("pid-c"),
+                false,
+            );
+            for notif in if terminal_first {
+                [&terminal, &batch]
+            } else {
+                [&batch, &terminal]
+            } {
+                let _ = handle_ext_notification(notif, &mut app);
+            }
+
+            let agent = app.agents.get(&AgentId(0)).unwrap();
+            assert_eq!(
+                last_marker_stop_hook_groups(&agent.scrollback),
+                Some(1),
+                "the cancelled turn's hook batch must render inside its marker \
+                 (terminal_first={terminal_first})"
+            );
+            assert_eq!(count_lifecycle_blocks(&agent.scrollback), 0);
+        }
     }
 
     #[test]
@@ -837,9 +1513,7 @@
 
     #[test]
     fn will_wake_flag_is_ignored_wire_compat_pin() {
-        // `will_wake` is a wire-compat field the TUI no longer reads: a
-        // stamped completion must behave exactly like an unstamped one
-        // (chip-only). Pins the "ignored, not load-bearing" contract.
+        // `will_wake` is a wire-compat field the TUI no longer reads.
         let mut app = make_app_with_agent("sess-wake-skip");
         seed_two_bg_tasks(&mut app, "sess-wake-skip");
 
@@ -939,6 +1613,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1017,7 +1692,17 @@
                 .contains("p-first")
         );
 
-        // A second load (reconnect) enters a fresh replay window.
+        // A second load (reconnect) enters a fresh replay window. An armed
+        // cancel resend belongs to the pre-reload turn and must drop with it.
+        app.agents.get_mut(&id).unwrap().pending_cancel_resend =
+            Some(crate::app::agent_view::PendingCancelResend {
+                prompt_id: Some("p-first".into()),
+                sent_at: std::time::Instant::now(),
+                attempts: 1,
+                confirmed: false,
+                cancel_subagents: true,
+                trigger: crate::app::actions::CancelTrigger::Esc,
+            });
         app.agents.get_mut(&id).unwrap().begin_session_reload(1);
         let agent = &app.agents[&id];
         assert!(
@@ -1028,15 +1713,16 @@
             agent.unexpected_replay_drops, 0,
             "begin_replay_window must reset every replay-coupled field together"
         );
+        assert!(
+            agent.pending_cancel_resend.is_none(),
+            "an armed cancel resend must not survive into the reload window"
+        );
         assert!(agent.session.loading_replay);
     }
 
     #[test]
     fn wake_stop_hooks_render_standalone_at_arrival() {
-        // Wake turns close markerless, so a wake-pid stop batch has no marker
-        // to fold into — it renders standalone the moment it arrives, whether
-        // it beats or trails its wake TurnCompleted. Never stashed: a stash
-        // keyed to a wake pid would wait for a marker that never comes.
+        // Never stashed: a stash keyed to a wake pid could wait for a marker that never comes.
         let mut app = make_app_with_agent("sess-wake-idle");
 
         // Hook beats the wake terminal.
@@ -1078,9 +1764,6 @@
 
     #[test]
     fn wake_stop_hooks_never_stash_under_local_turn() {
-        // A wake batch landing while a LOCAL turn runs must not stash under
-        // (or fold onto) the unrelated local turn — it renders standalone,
-        // and the local turn's marker rail stays clean.
         let mut app = make_app_with_agent("sess-wake-local");
         {
             let agent = app.agents.get_mut(&AgentId(0)).unwrap();
@@ -1110,3 +1793,610 @@
         );
     }
 
+    fn begin_replay(app: &mut AppView) {
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .session
+            .loading_replay = true;
+    }
+
+    #[test]
+    fn replay_completed_with_elapsed_pushes_worked_for() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p1",
+                "end_turn",
+                Some(2500),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("p1"));
+        match last_session_event(&agent.scrollback) {
+            Some(SessionEvent::TurnCompleted { elapsed: Some(d) }) => {
+                assert_eq!(d, std::time::Duration::from_millis(2500));
+            }
+            other => panic!("expected Worked-for marker, got {other:?}"),
+        }
+        assert!(agent.turn_started_at.is_none());
+        assert!(agent.expect_send_now_cancel.is_none());
+    }
+
+    #[test]
+    fn replay_completed_without_elapsed_is_turn_completed_not_zero() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-1", "p1", "end_turn", true),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        match last_session_event(&agent.scrollback) {
+            Some(ev @ SessionEvent::TurnCompleted { elapsed: None }) => {
+                assert_eq!(ev.message(), "Turn completed.");
+            }
+            other => panic!("expected markerless-elapsed completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_cancelled_pushes_cancelled_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p1",
+                "cancelled",
+                Some(800),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnCancelled { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_hook_denied_pushes_blocked_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p1",
+                "cancelled",
+                Some(400),
+                None,
+                serde_json::json!({ "cancellationCategory": "HookDenied" }),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnBlockedByHook { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_failed_without_banner_pushes_failed_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p1",
+                "error",
+                Some(100),
+                Some("boom"),
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_failed_with_banner_skips_failed_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent.scrollback.push_block(
+                crate::scrollback::block::RenderBlock::session_event(SessionEvent::RequestFailed {
+                    status: Some(400),
+                    headline: "Bad request (400)".into(),
+                    detail: "The server rejected this request.".into(),
+                }),
+            );
+        }
+        begin_replay(&mut app);
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p1",
+                "error",
+                Some(100),
+                Some("boom"),
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("p1"));
+        assert_eq!(agent.scrollback.len(), len_before);
+    }
+
+    #[test]
+    fn replay_rate_limit_records_pid_no_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p1",
+                "rate_limit",
+                Some(50),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("p1"));
+        assert_eq!(agent.scrollback.len(), len_before);
+    }
+
+    #[test]
+    fn replay_chatty_rate_limited_wake_paints_failure_marker() {
+        // Live `finish_wake_turn` paints TurnFailed for a chatty rate-limited
+        // wake; replay must not drop that footer.
+        let mut app = make_app_with_agent("sess-wake");
+        begin_replay(&mut app);
+        let _ = handle(
+            make_replay_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-wake",
+                "task-completed-bg1",
+                "rate_limit",
+                Some(50),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("task-completed-bg1"));
+        assert_eq!(agent.scrollback.len(), len_before + 1);
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { .. })
+        ));
+        assert_eq!(
+            agent.failed_wake_marker_for.as_deref(),
+            Some("task-completed-bg1")
+        );
+    }
+
+    #[test]
+    fn replay_silent_rate_limited_wake_stays_markerless() {
+        let mut app = make_app_with_agent("sess-wake");
+        begin_replay(&mut app);
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "rate_limit", true),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("task-completed-bg1"));
+        assert_eq!(agent.scrollback.len(), len_before);
+        assert!(agent.failed_wake_marker_for.is_none());
+    }
+
+    #[test]
+    fn replay_send_now_records_pid_no_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p1",
+                "cancelled",
+                Some(50),
+                None,
+                serde_json::json!({ "cancelTrigger": "send_now" }),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("p1"));
+        assert_eq!(agent.scrollback.len(), len_before);
+    }
+
+    #[test]
+    fn replay_unknown_stop_reason_pushes_completed_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p1",
+                "brand_new_token",
+                Some(10),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("p1"));
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnCompleted { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_duplicate_pid_one_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let n = xai_turn_completed_replay(
+            "sess-1",
+            "p1",
+            "end_turn",
+            Some(10),
+            None,
+            serde_json::json!({}),
+        );
+        let _ = handle_ext_notification(&n, &mut app);
+        let _ = handle_ext_notification(&n, &mut app);
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            crate::app::agent_view::test_fixtures::count_turn_markers(agent),
+            1
+        );
+    }
+
+    #[test]
+    fn replay_two_pids_two_markers() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p1",
+                "end_turn",
+                Some(10),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p2",
+                "end_turn",
+                Some(20),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("p1"));
+        assert!(agent.replayed_terminal_prompts.contains("p2"));
+        assert_eq!(
+            crate::app::agent_view::test_fixtures::count_turn_markers(agent),
+            2
+        );
+    }
+
+    #[test]
+    fn replay_silent_wake_records_pid_no_marker() {
+        let mut app = make_app_with_agent("sess-wake");
+        begin_replay(&mut app);
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "end_turn", true),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("task-completed-bg1"));
+        assert_eq!(agent.scrollback.len(), len_before);
+    }
+
+    #[test]
+    fn replay_stop_hooks_stay_standalone() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let _ = handle_ext_notification(
+            &xai_hook_execution_notif_for_prompt("sess-1", "stop", Some("p1"), true),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p1",
+                "end_turn",
+                Some(10),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_hook_execution_notif_for_prompt("sess-1", "stop", Some("p1"), true),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(count_lifecycle_blocks(&agent.scrollback), 2);
+        assert!(agent.pending_stop_hooks.is_none());
+        match last_session_event(&agent.scrollback) {
+            Some(SessionEvent::TurnCompleted { .. }) => {}
+            other => panic!("expected completed marker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_wake_suppressed_tool_only_records_pid_no_marker() {
+        let mut app = make_app_with_agent("sess-wake");
+        begin_replay(&mut app);
+        send_replay_suppressed_tool_call(&mut app, "sess-wake", "task-completed-bg1");
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-wake",
+                "task-completed-bg1",
+                "end_turn",
+                Some(10),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("task-completed-bg1"));
+        assert!(
+            !agent.replayed_visible_prompts.contains("task-completed-bg1"),
+            "a suppressed TodoWrite must not count as visible output"
+        );
+        assert_eq!(agent.scrollback.len(), len_before);
+    }
+
+    #[test]
+    fn replay_goal_summary_error_stays_markerless() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "goal-summary-g1",
+                "error",
+                Some(10),
+                Some("classifier failed"),
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("goal-summary-g1"));
+        assert_eq!(agent.scrollback.len(), len_before);
+    }
+
+    #[test]
+    fn replay_direct_bash_records_pid_no_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        send_replay_bash_tool_call(&mut app, "sess-1", "p-bash");
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p-bash",
+                "end_turn",
+                Some(10),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("p-bash"));
+        assert!(agent.replayed_bash_prompts.contains("p-bash"));
+        assert_eq!(
+            agent.scrollback.len(),
+            len_before,
+            "direct bash must not paint a Worked-for marker"
+        );
+    }
+
+    #[test]
+    fn replay_direct_bash_cancelled_paints_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        send_replay_bash_tool_call(&mut app, "sess-1", "p-bash");
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p-bash",
+                "cancelled",
+                Some(10),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("p-bash"));
+        assert!(agent.replayed_bash_prompts.contains("p-bash"));
+        assert_eq!(
+            agent.scrollback.len(),
+            len_before + 1,
+            "cancelled direct bash must paint TurnCancelled"
+        );
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnCancelled { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_direct_bash_error_paints_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        send_replay_bash_tool_call(&mut app, "sess-1", "p-bash");
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "p-bash",
+                "error",
+                Some(10),
+                Some("boom"),
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("p-bash"));
+        assert!(agent.replayed_bash_prompts.contains("p-bash"));
+        assert_eq!(
+            agent.scrollback.len(),
+            len_before + 1,
+            "failed direct bash must paint TurnFailed"
+        );
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_empty_prompt_id_records_no_marker() {
+        let mut app = make_app_with_agent("sess-1");
+        begin_replay(&mut app);
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-1",
+                "",
+                "end_turn",
+                Some(10),
+                None,
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains(""));
+        assert_eq!(agent.scrollback.len(), len_before);
+    }
+
+    /// Builds a live `LastTurnSummary` notification.
+    fn xai_last_turn_summary_notif(
+        session_id: &str,
+        summary: &str,
+        prompt_id: Option<&str>,
+    ) -> acp::ExtNotification {
+        let payload = SessionNotification {
+            session_id: acp::SessionId::new(session_id),
+            update: XaiSessionUpdate::LastTurnSummary {
+                summary: summary.into(),
+                prompt_id: prompt_id.map(String::from),
+            },
+            meta: None,
+        };
+        acp::ExtNotification::new(
+            "x.ai/session/update",
+            std::sync::Arc::from(serde_json::value::to_raw_value(&payload).unwrap()),
+        )
+    }
+
+    /// Show-until-replaced: a summary stays on the row across a later
+    /// cancelled turn (the shell generates none for it), survives turn
+    /// start/finish untouched, and is replaced by the next delivery.
+    /// Viewer-mode, mirroring `live_turn_completed_finalizes_viewer_turn`.
+    #[test]
+    fn last_turn_summary_shows_until_replaced() {
+        let mut app = make_app_with_agent("sess-lts");
+        app.agents.get_mut(&AgentId(0)).unwrap().attached_as_viewer = true;
+
+        // Turn A runs, completes, and its summary arrives.
+        let _ = handle(
+            make_agent_chunk_message_with_prompt("sess-lts", "chunk", "pid-a", false),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-lts", "pid-a", "end_turn", false),
+            &mut app,
+        );
+        let affected = handle_ext_notification(
+            &xai_last_turn_summary_notif("sess-lts", "Did the thing", Some("pid-a")),
+            &mut app,
+        );
+        assert!(affected);
+        assert_eq!(
+            app.agents.get(&AgentId(0)).unwrap().last_turn_summary.as_deref(),
+            Some("Did the thing")
+        );
+
+        // Turn B runs and is cancelled (no replacement summary): A's summary
+        // stays — the row keeps showing the last successful turn's work.
+        let _ = handle(
+            make_agent_chunk_message_with_prompt("sess-lts", "chunk", "pid-b", false),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-lts", "pid-b", "cancelled", false),
+            &mut app,
+        );
+        assert!(app.agents.get(&AgentId(0)).unwrap().session.state.is_idle());
+        assert_eq!(
+            app.agents.get(&AgentId(0)).unwrap().last_turn_summary.as_deref(),
+            Some("Did the thing"),
+            "a cancelled turn must not blank the previous summary"
+        );
+
+        // Turn C succeeds; its summary replaces A's.
+        let _ = handle(
+            make_agent_chunk_message_with_prompt("sess-lts", "chunk", "pid-c", false),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-lts", "pid-c", "end_turn", false),
+            &mut app,
+        );
+        let affected = handle_ext_notification(
+            &xai_last_turn_summary_notif("sess-lts", "Did the next thing", Some("pid-c")),
+            &mut app,
+        );
+        assert!(affected);
+        assert_eq!(
+            app.agents.get(&AgentId(0)).unwrap().last_turn_summary.as_deref(),
+            Some("Did the next thing")
+        );
+    }

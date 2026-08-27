@@ -9,7 +9,9 @@ pub(super) fn turn_result_to_hook_outcome(
 ) -> xai_tool_protocol::turn_hook::TurnHookOutcome {
     use xai_tool_protocol::turn_hook::TurnHookOutcome;
     match result {
-        Ok(TurnOutcome::Completed { .. }) => TurnHookOutcome::Completed,
+        Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded { .. }) => {
+            TurnHookOutcome::Completed
+        }
         Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. }) => {
             TurnHookOutcome::Cancelled
         }
@@ -21,7 +23,7 @@ pub(super) fn turn_result_to_hook_outcome(
 /// as its bare snake_case wire string for the `after_turn` hook payload.
 /// Deliberately `serde_json::to_value` + `as_str`, NOT `to_string` — the
 /// latter yields the quoted form and fails the workspace decode.
-pub(super) fn cancellation_category_wire_string(
+pub(super) fn cancellation_category_to_wire_string(
     category: Option<crate::session::events::CancellationCategory>,
 ) -> Option<String> {
     let category = category?;
@@ -57,7 +59,8 @@ pub(super) fn map_tool_outcome(
 ///
 /// Internal/high-frequency updates (hook scrollback, retry progress, config
 /// changes) are excluded so migrated hooks only fire on user-attention
-/// events — not on every tool call or session tick.
+/// events — not on every tool call or session tick. `DiffReview` always waits
+/// on the user, so it is safe to fire `permission_prompt` here.
 #[allow(clippy::type_complexity)]
 pub(super) fn notification_hook_for_update(
     update: &XaiSessionUpdate,
@@ -96,6 +99,7 @@ impl SessionActor {
         xai_grok_hooks::runner::RunContext {
             session_id: &self.session_info.id.0,
             workspace_root: &self.hook_resolved_workspace_root,
+            process_scope: self.tool_context.process_scope.clone(),
         }
     }
 
@@ -146,6 +150,19 @@ impl SessionActor {
                     HookRunResult::Skipped { hook_name } => {
                         (hook_name.clone(), HookRunStatusDto::Skipped)
                     }
+                    HookRunResult::Blocked {
+                        hook_name,
+                        detail,
+                        elapsed,
+                        ..
+                    } => (
+                        hook_name.clone(),
+                        HookRunStatusDto::Failed {
+                            error: detail.clone(),
+                            elapsed_ms: elapsed.as_millis() as u64,
+                            blocked: true,
+                        },
+                    ),
                     HookRunResult::Failed {
                         hook_name,
                         error,
@@ -156,6 +173,7 @@ impl SessionActor {
                         HookRunStatusDto::Failed {
                             error: error.clone(),
                             elapsed_ms: elapsed.as_millis() as u64,
+                            blocked: false,
                         },
                     ),
                 };
@@ -218,7 +236,7 @@ impl SessionActor {
         prompt_id: Option<&str>,
         tool_name: Option<&str>,
     ) {
-        if !self.hook_event_active(event) {
+        if !self.may_have_hooks_for(event) {
             return;
         }
         // Fires observe-only client hooks before (and independent of) the on-disk registry guard below.
@@ -227,6 +245,8 @@ impl SessionActor {
             return;
         };
         let ctx = self.hook_run_ctx();
+        // Prompt-gate events go through dispatch_prompt_submit_hook;
+        // dispatch_non_blocking debug-asserts observe-only.
         let results =
             xai_grok_hooks::dispatcher::dispatch_non_blocking(&registry, event, &envelope, &ctx)
                 .await;
@@ -234,6 +254,44 @@ impl SessionActor {
             .await;
         self.emit_hook_executed_telemetry(&event.to_string(), tool_name, &results)
             .await;
+    }
+
+    /// Enforcement scope for a prompt-gate block: only a real user prompt on
+    /// a top-level session. The event fires for every origin, but synthetic
+    /// wakes and subagent sessions run the gate observe-only.
+    pub(super) fn should_enforce_prompt_block(
+        &self,
+        policy: &xai_agent_lifecycle::InputPolicy,
+    ) -> bool {
+        policy.authority.is_human_intent() && !self.startup_hints.is_subagent
+    }
+
+    /// Run the `UserPromptSubmit` prompt gate: observe client hooks, then the
+    /// on-disk registry, with the shared scrollback and telemetry side
+    /// effects. Returns the gate verdict; the caller decides whether to
+    /// enforce it (`Block` rejects the prompt).
+    pub(super) async fn dispatch_prompt_submit_hook(
+        &self,
+        payload: xai_grok_hooks::event::HookPayload,
+        prompt_id: Option<&str>,
+    ) -> xai_grok_hooks::result::PromptDecision {
+        let event = xai_grok_hooks::event::HookEventName::UserPromptSubmit;
+        if !self.may_have_hooks_for(event) {
+            return xai_grok_hooks::result::PromptDecision::Allow;
+        }
+        // Fires observe-only client hooks before (and independent of) the on-disk registry guard below.
+        let envelope = self.fire_hook(event, prompt_id.map(|s| s.to_string()), payload);
+        let Some(registry) = self.hook_registry.borrow().clone() else {
+            return xai_grok_hooks::result::PromptDecision::Allow;
+        };
+        let ctx = self.hook_run_ctx();
+        let gate =
+            xai_grok_hooks::dispatcher::dispatch_prompt_gate(&registry, &envelope, &ctx).await;
+        self.send_hook_execution(&event.to_string(), None, prompt_id, &gate.results)
+            .await;
+        self.emit_hook_executed_telemetry(&event.to_string(), None, &gate.results)
+            .await;
+        gate.decision
     }
 
     pub(super) async fn emit_hook_executed_telemetry(
@@ -251,6 +309,13 @@ impl SessionActor {
                     hook_name,
                     elapsed,
                     xai_grok_telemetry::events::HookOutcome::Success,
+                ),
+                xai_grok_hooks::result::HookRunResult::Blocked {
+                    hook_name, elapsed, ..
+                } => (
+                    hook_name,
+                    elapsed,
+                    xai_grok_telemetry::events::HookOutcome::Blocked,
                 ),
                 xai_grok_hooks::result::HookRunResult::Failed {
                     hook_name, elapsed, ..
@@ -280,8 +345,8 @@ mod notification_hook_filter_tests {
     };
 
     #[test]
-    fn hook_execution_does_not_fire_notification_hook() {
-        let update = XaiSessionUpdate::HookExecution {
+    fn hook_updates_do_not_fire_notification_hook() {
+        let execution = XaiSessionUpdate::HookExecution {
             event_name: "pre_tool_use".into(),
             tool_name: Some("read_file".into()),
             prompt_id: None,
@@ -291,15 +356,12 @@ mod notification_hook_filter_tests {
                 output: None,
             }],
         };
-        assert!(notification_hook_for_update(&update).is_none());
-    }
+        assert!(notification_hook_for_update(&execution).is_none());
 
-    #[test]
-    fn hook_annotation_does_not_fire_notification_hook() {
-        let update = XaiSessionUpdate::HookAnnotation {
+        let annotation = XaiSessionUpdate::HookAnnotation {
             message: "running hooks".into(),
         };
-        assert!(notification_hook_for_update(&update).is_none());
+        assert!(notification_hook_for_update(&annotation).is_none());
     }
 
     #[test]
@@ -357,7 +419,11 @@ mod notification_hook_filter_tests {
                 kind: Default::default(),
                 block_waited: false,
                 explicitly_killed: false,
+                kill_result_delivered: false,
                 owner_session_id: None,
+                description: None,
+                is_backgrounded: false,
+                output_total_bytes: 0,
             },
             will_wake: false,
         };

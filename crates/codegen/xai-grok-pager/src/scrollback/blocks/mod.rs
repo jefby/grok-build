@@ -16,6 +16,7 @@ mod system;
 mod thinking;
 pub mod tool;
 mod user;
+mod workflow;
 
 pub use agent::AgentMessageBlock;
 pub use bg_task::{BgTaskBlock, BgTaskKind};
@@ -29,11 +30,12 @@ pub use thinking::ThinkingBlock;
 pub use tool::{
     DiffLineOutput, DiffRenderConfig, DiscoveredTool, EditToolCallBlock, ExecuteToolCallBlock,
     IntegrationSearchToolCallBlock, LineRange, ListDirToolCallBlock, OtherToolCallBlock,
-    ReadToolCallBlock, SearchFileMatch, SearchLineMatch, SearchToolCallBlock, ToolCallBlock,
-    UseToolCallBlock, discovered_tool_action, render_diff_hunk_highlighted,
-    render_diff_hunks_highlighted,
+    ReadToolCallBlock, SearchFileMatch, SearchLineMatch, SearchToolCallBlock,
+    SentMessagePresentation, SentMessageToolCallBlock, ToolCallBlock, UseToolCallBlock,
+    discovered_tool_action, render_diff_hunk_highlighted, render_diff_hunks_highlighted,
 };
 pub use user::UserPromptBlock;
+pub use workflow::{WorkflowBlock, WorkflowBlockPhase, WorkflowBlockStatus};
 
 // Backwards compatibility alias
 pub type EditBlock = EditToolCallBlock;

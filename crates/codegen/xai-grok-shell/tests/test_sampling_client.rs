@@ -387,6 +387,59 @@ async fn chat_completions_collect_synthesizes_reasoning_sibling() {
     );
 }
 
+/// End-to-end pin of the collect-path LengthPolicy gate: under the default
+/// `Fail`, a `finish_reason: length` stream must surface as
+/// `MaxTokensTruncation` from `conversation_collect` — every direct caller
+/// (autocomplete, memory notes, summaries) relies on this to never receive
+/// a silently truncated `Ok`.
+#[tokio::test]
+async fn conversation_collect_default_policy_fails_length_finish() {
+    let events = vec![
+        SseEvent::data(
+            json!({
+                "id": "chatcmpl-len",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": "grok-test",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": "truncated answ" },
+                    "finish_reason": null
+                }]
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            json!({
+                "id": "chatcmpl-len",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": "grok-test",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "length"
+                }]
+            })
+            .to_string(),
+        ),
+        SseEvent::data("[DONE]"),
+    ];
+    let server = MockInferenceServer::start().await.unwrap();
+    server.enqueue_response("/v1/chat/completions", ScriptedResponse::sse(events));
+    let client = create_test_client(&server.url(), ApiBackend::ChatCompletions);
+
+    let request = ConversationRequest::from_items(vec![ConversationItem::user("question")]);
+    let err = client
+        .conversation_collect(request)
+        .await
+        .expect_err("default LengthPolicy::Fail must reject a Length stop");
+    assert!(
+        matches!(err, SamplingError::MaxTokensTruncation),
+        "expected MaxTokensTruncation, got {err:?}"
+    );
+}
+
 /// Upgrade path: a legacy chat-completions session on disk —
 /// an assistant carrying inline `reasoning: {text}` — must, when loaded,
 /// reconstruct a sibling Reasoning item, which then folds into
@@ -896,7 +949,7 @@ async fn test_chat_completions_401_unauthorized() {
     let result = client.conversation_stream(request).await;
     assert!(result.is_err());
 
-    if let Err(SamplingError::Auth(_)) = result {
+    if let Err(SamplingError::Auth { .. }) = result {
         // Expected
     } else {
         panic!("Expected Auth error");
@@ -939,7 +992,7 @@ async fn test_responses_api_401_unauthorized() {
     let result = client.conversation_stream_responses(request).await;
     assert!(result.is_err());
 
-    if let Err(SamplingError::Auth(_)) = result {
+    if let Err(SamplingError::Auth { .. }) = result {
         // Expected
     } else {
         panic!("Expected Auth error");
@@ -1216,7 +1269,7 @@ async fn test_doom_loop_check_enabled_sends_header_and_absorbs_check_event() {
 
     let logged = server.requests().pop().unwrap();
     assert!(logged.path.contains("/responses"));
-    assert_eq!(logged.header("x-grok-doom-loop-check"), Some("true"));
+    assert_eq!(logged.header("x-grok-doom-loop-check"), Some("1024"));
 }
 
 /// With the check disabled no header goes on the wire, and check frames from

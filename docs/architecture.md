@@ -63,6 +63,30 @@ grok-build/
 | `crates/common/xai-computer-hub-*` | Computer Hub：工具服务器、连接池、WebSocket 复用、MCP 适配 |
 | `crates/common/xai-grok-compaction` | 传输无关的压缩核心（策略、提示、选择、组装） |
 
+### 2.2 会话存储布局
+
+会话以 `~/.grok/sessions/<encoded-cwd>/<session-id>/` 目录组织（可用 `GROK_HOME` 覆盖基础目录）：
+
+```text
+~/.grok/sessions/<encoded-cwd>/<session-id>/
+├── summary.json             # 索引条目：标题/摘要、时间戳、模型 ID、消息计数、父会话引用
+├── updates.jsonl            # ACP session update 流（会话内容权威来源，驱动 /resume 与恢复）
+├── chat_history.jsonl       # 发给模型的原始聊天消息
+├── plan.json                # TODO/任务列表状态
+├── plan_mode.json           # Plan 模式生命周期快照
+├── rewind_points.jsonl      # /rewind 撤销点
+├── signals.json             # 会话信号（token 用量、工具/turn 计数）
+├── feedback.jsonl           # 用户反馈（thumbs/stars/文本/忽略）
+├── btw_history.jsonl        # /btw 旁路提问历史
+├── goal/state.json          # Goal 模式状态
+├── compaction_checkpoints/  # 压缩保存点（手动或自动）
+├── compaction/              # Segments 压缩模式下的每段 Markdown（COMPACTION_DIR）
+├── announcement_state.json  # 公告已读状态
+└── subagents/               # 每个子 Agent 的 meta.json；子会话本体在正常 sessions 树中
+```
+
+编码规则：cwd 目录名 URL 编码；超过 255 字节时退化为 slug+hash 并在目录内记录 `.cwd` 文件。`grok sessions search` 额外维护 `~/.grok/sessions/session_search.sqlite`（SQLite FTS5）作为标题/提示词全文索引。
+
 ---
 
 ## 3. 高层架构
@@ -191,11 +215,22 @@ flowchart LR
 
 关键节点：
 
-1. **Tool prep**：`prepare_tool_definitions_timed` 从 `Agent::ToolBridge` 收集工具定义（内置 + MCP）。
-2. **Request build**：`ChatStateHandle::build_request` 组装历史消息与工具定义。
-3. **Sampling**：`xai-grok-sampler` 负责流式、重试、取消、401 刷新、上下文溢出压缩。
-4. **Tool execution**：`execute_tool_calls` 并发调度；同一路径写操作串行化。
-5. **Recovery**：401 触发 `RefreshAuthAndResubmit`；上下文窗口超限触发 `CompactAndResubmit`。
+1. **Tool prep**：`prepare_tool_definitions_timed` 从 `Agent::ToolBridge` 收集工具定义（内置 + MCP），按会话可见性过滤。
+2. **Request build**：`ChatStateHandle::build_request` 组装历史消息与工具定义；涉及 image budget 等上下文预算控制。
+3. **Sampling**：`xai-grok-sampler` 采用三层 API——`SamplingClient`（原始 chunk 流）→ `stream` 变换（`stream_chat_completions` / `stream_responses` / `stream_messages`）→ `SamplerHandle`（actor 化：重试、取消、事件协调）。支持 401 归属（`attribution`）与 doom-loop 恢复。
+4. **Tool execution**：`execute_tool_calls` 并发调度；同一路径写操作串行化；`tool_dispatch.rs` 负责权限门控后的实际分发。
+5. **Recovery**：401 触发 `RefreshAuthAndResubmit`（走 `AuthManager` 刷新链）；上下文窗口超限触发 `CompactAndResubmit`（按 `CompactionMode` 落盘压缩段）。
+
+完整的 turn 内部步骤：
+
+1. 用户 prompt 入队 `ChatState`，同时写入持久化通道（`PersistenceMsg::Chat`）。
+2. 会话 actor 检查 hook 门控（`pre_tool_use` / `pre_prompt` 等事件，见 §7.3）。
+3. 构建 `ConversationRequest`（历史 + 工具定义 + 系统提示），发送给采样 actor。
+4. 采样 actor 流式返回 chunk；文本/思考增量实时推送到客户端（TUI/stdio/ACP）。
+5. 工具调用到达 → `tool_calls.rs` 解析校验参数 → 权限/Plan Mode 门控 → 分发执行。
+6. 工具结果写回 `ChatState`（含 tool layer images 等多媒体结果）。
+7. 回到步骤 3 继续采样，直到模型不再请求工具或触发停止条件。
+8. 轮次结束：`turn_end.rs` 处理 turn summary、`turn_report_slot`、`turn_end_hooks`；持久化 `NextTraceTurn` 等遥测字段。
 
 ### 5.3 Agent 响应 → TUI 渲染
 
@@ -272,6 +307,20 @@ sequenceDiagram
 - `PagerTerminal` 基于 `xai_ratatui_inline::Terminal`，通过独立 `TermWriter` 线程写 stderr，避免阻塞 async 事件循环。
 - 屏幕模式：`Fullscreen`（备用屏幕）、`Inline`（内联）、`Minimal`（原生滚动回显）。
 
+事件循环（`app::event_loop`）：
+
+1. 输入源（crossterm 事件、ACP 消息、任务结果、信号）汇入统一事件队列。
+2. `actions.rs` 将事件翻译为 `Action`，再拆分为立即 `Effect` 与异步 `TaskResult`。
+3. 异步任务完成后的结果回投队列，驱动下一轮视图更新。
+4. `signal_handler` 处理 SIGINT/SIGTERM 等；`cancel_latency`/`exit_timeout` 控制退出路径。
+5. 会话启动有 `session_startup` 屏障（`session_load_barrier`），避免在恢复完成前绘制。
+
+渲染管线（`xai-grok-pager-render`）：
+
+- `AppView` 计算脏区域 → `Presenter::request` → ratatui 绘制；Markdown/Mermaid 通过后台 worker（`mermaid_worker`）异步渲染。
+- 图像支持：`image_overlay` / `inline_media_ffmpeg`（ffmpeg 转码内联媒体）。
+- diff 渲染：`xai-grok-pager-diff` 把编辑工具输出转成行级 `DiffHunk`。
+
 ### 6.2 运行时层：xai-grok-shell / xai-grok-agent
 
 #### xai-grok-shell
@@ -292,6 +341,21 @@ sequenceDiagram
 | `managed_config` | 托管配置（团队/企业）管理与签名校验 |
 | `mcp_doctor` | MCP 服务器诊断 |
 | `waterfall` | 子 Agent 派生流水线的测试标记（`GROK_SUBAGENT_WATERFALL`） |
+
+会话 actor 与持久化：
+
+- 每个会话由 `SessionActor` 驱动，内部再拆分：`acp_session`（ACP 适配）、`acp_session_impl`（turn/工具/队列等实现）、`acp_session_tests`（集成测试）。
+- 持久化走**独立 actor + mpsc 通道**：`ChatPersistence` trait 的实现 `ChannelChatPersistence` 把每次写入翻译成 `PersistenceMsg`（`Chat` / `Update` / `ContentChunk` / `ReplaceChatHistory` / `AppendCwdSwitchAndAck` / `PlanState` / `PlanModeState` / `RewindPoint` / `TruncateRewindPoints` / `MergeRewindPointsFrom` / `CurrentModel` 等），由 `PersistenceHandle` 串行落盘，避免阻塞会话主循环。
+- 图片剥离（image strip）等破坏性改写走 `ReplaceChatHistoryForStripAndAck`：**先备份、后重写**，备份落盘成功才允许销毁原历史。
+- 磁盘格式见 §2.2。
+
+子 Agent 派生管线：
+
+1. `subagent_coordinator` 收到 spawn 请求 → `subagent_spawn` 构建 child runtime。
+2. child 会话写入 `subagents/` 元数据；子会话本体位于正常 sessions 树（`sessions/<cwd>/<child-id>/`）。
+3. `attempt_store`（codec/decoder/intent/recovery/rewind）持久化派生尝试，支持断点恢复与回退。
+4. 父会话通过 `child_tool_projection` 把子 Agent 的工具调用投影回父视图；`prompt_turn_receipt` 记录派生完成的回执。
+5. `waterfall` 模块在 `GROK_SUBAGENT_WATERFALL=1` 时输出单调时钟标记，供回归测试解析。
 
 #### xai-grok-agent
 
@@ -317,19 +381,26 @@ sequenceDiagram
 
 分发流程：
 
-1. `ToolRegistryBuilder::new()` 静态注册内置工具。
+1. `ToolRegistryBuilder::new()` 静态注册内置工具（按 `implementations/` 下的 namespace 目录组织）。
 2. 运行时 MCP 工具通过 `FinalizedToolset::register_tool` 动态注册。
 3. `ToolBridge` 将调用转发到 `FinalizedToolset::call`。
 4. `use_tool` 通过 `InnerDispatchForToolset` 再次分发到 MCP 工具，避免外层死锁。
+
+特殊工具：
+
+- **`task` 工具**：驱动子 Agent（`GrokBuild:run_terminal_cmd` 与 `GrokBuildConcise:run_terminal_cmd` 共用 task 类型）；子 Agent 会话写入正常 sessions 树。
+- **LSP 工具**：`implementations/lsp` 提供语言服务器能力；`implementations/editor_infra` 提供编辑器基础设施。
+- **搜索工具**：`search_tool` 封装 ripgrep 内容搜索与文件查找。
+- **Computer 工具**：`implementations/computer` 走 `xai-computer-hub-*` 的 WebSocket 复用通道调用外部工具服务器。
 
 #### xai-grok-workspace
 
 作为本地工作区宿主，职责包括：
 
-- **文件系统**：`AsyncFileSystem` trait，支持 `LocalFs`、`MockFs`、`AcpFsAdapter`；分页目录列表、二进制安全范围读取、模糊搜索（`xai-fuzzy-file-search`）、ripgrep 内容搜索、gitignore 处理、worktree 支持。
-- **VCS**：Git status、diff、stage、commit、checkout、stash、分支、检查点。
-- **执行**：每个 `WorkspaceSession` 持有会话级 `TerminalBackend`（`xai-grok-shell-terminal` 提供 Local/ACP/PTY 运行器），执行 bash、后台任务、监控、定时任务。
-- **检查点/回滚**：`FileStateTracker` 捕获提示前后快照；`rewind_to` 恢复文件、hunk、git 状态。
+- **文件系统**：`AsyncFileSystem` trait，支持 `LocalFs`、`MockFs`、`AcpFsAdapter`；分页目录列表、二进制安全范围读取、模糊搜索（`xai-fuzzy-file-search`：`ignore` 遍历 + `nucleo` 匹配，后台线程驱动）、ripgrep 内容搜索、gitignore 处理、worktree 支持（`xai-fast-worktree`：gitdir 复制、checkout、回收）。
+- **VCS**：Git status、diff、stage、commit、checkout、stash、分支、检查点（`xai-gix-status` 提供 git status 解析）。
+- **执行**：每个 `WorkspaceSession` 持有会话级 `TerminalBackend`（`xai-grok-shell-terminal` 提供 Local/ACP/PTY 运行器；`ptyctl` 提供 PTY 控制），执行 bash、后台任务、监控、定时任务。
+- **检查点/回滚**：`FileStateTracker` 捕获提示前后快照（`xai-hunk-tracker` 跟踪 hunk）；`rewind_to` 恢复文件、hunk、git 状态；`rewind_points.jsonl` 持久化撤销点。
 - **权限**：`CapabilityMode` 按 `ToolKind` 过滤工具；权限管理器处理自动/询问/YOLO 模式。
 - **沙箱**：`xai-grok-sandbox` 提供 `workspace` / `read-only` / `strict` / `devbox` 内置 profile（Landlock/Seatbelt），子进程由内核强制限制。
 - **工作区服务器**：`xai-grok-workspace-daemon` 负责 workspace-server 守护进程化（double-fork + pidfile）与预览代理监督；`xai-grok-diag-server` 提供进程内 `/ready`、`/statusz`、`/logs` 诊断端点。
@@ -340,13 +411,30 @@ sequenceDiagram
 
 - Actor 化会话状态：`ChatStateActor::spawn_with_pruning` 在独立任务运行。
 - `ChatStateHandle` 用于推送用户/助手/工具结果消息、构建采样请求、记录 token 使用。
-- 支持上下文压缩、持久化、剪枝。
+- 支持上下文压缩、持久化、剪枝；记录 `last_compaction_prompt_index` 供增量压缩。
+
+压缩（Compaction）分层：
+
+| 层 | 职责 |
+|----|------|
+| `xai-chat-state::CompactionMode` | 模式决策 + 摘要提示文本（`format_compact_summary`） |
+| `xai-compaction-transcript` | 压缩段 → 自包含 Markdown 的纯渲染（无 I/O，`INDEX_HEADER` + `render_index_row` 增量索引） |
+| shell `StorageAdapter` | 磁盘 I/O：按模式写入对应 artifact |
+
+`CompactionMode` 三种模式：
+
+- `Summary`：仅摘要，无回指旧历史。
+- `Transcript`：摘要 + 指向完整原始 `updates.jsonl` 的指针。
+- `Segments`（默认）：摘要 + `compaction/` 目录下每段干净的 Markdown，detail 级别内联记录。
+
+触发路径：上下文窗口超限自动触发（`CompactAndResubmit`）、手动 `/compact`、以及 `compaction_checkpoints/` 保存点恢复。
 
 #### xai-grok-memory
 
 - Markdown 格式跨会话记忆，存储于 `~/.grok/memory/`。
-- 基于 SQLite + `sqlite-vec` 的向量搜索与嵌入。
-- 文件监听自动同步记忆索引；`dream` 模块负责记忆的周期性整理/回放。
+- 基于 SQLite + `sqlite-vec`（vec0 虚拟表 KNN 搜索）的向量搜索与嵌入（`embedding::ApiEmbeddingProvider`）。
+- 文件监听自动同步记忆索引（`MemoryFileWatcher`）；`chunker` 分块、`mmr` 相关性重排、`archive` 归档。
+- `dream` 模块负责记忆的周期性整理/回放（`dream_lock` 防止并发）。
 
 #### 工作流与 Dashboard
 
@@ -389,6 +477,44 @@ sequenceDiagram
 | `xai-tool-protocol` / `xai-tool-runtime` / `xai-tool-types` | Computer Hub 线协议（含 bot-relay 帧）、工具服务器运行时与共享类型 |
 | `xai-computer-hub-core` / `xai-computer-hub-mcp-adapter` / `xai-computer-hub-sdk` | Computer Hub 核心、MCP 适配、SDK（连接池、WebSocket 复用、重连回放） |
 | `xai-grok-compaction` / `xai-interjection-core` / `xai-circuit-breaker` / `xai-tracing` | 传输无关压缩核心、打断（interjection）核心、熔断、tracing |
+
+### 7.1 配置分层与合并顺序
+
+`xai-grok-config` 的加载顺序（低 → 高优先级）：
+
+1. **用户配置**：`$GROK_HOME/config.toml`（`USER_CONFIG_FILENAME`）。加载时做 `$VAR` 环境变量展开与 `[[version_overrides]]` 版本覆盖。
+2. **托管配置（用户层）**：`$GROK_HOME/managed_config.toml`（`MANAGED_CONFIG_FILENAME`）。
+3. **托管配置（系统层）**：`system_config_dir()/managed_config.toml`。
+4. **需求层（云同步）**：`requirements.toml`（`REQUIREMENTS_FILENAME`），服务端同步工件，通过 `validation` 叠加在默认配置之上，不直接合入。
+5. **MDM 偏好**：macOS `macos_managed` 读取受管偏好；`env_overlay` 提供环境变量覆盖；`signed_policy` 对策略做 Ed25519 签名校验。
+
+要点：
+
+- 无解析不出错的用户家目录时，用户层返回空表，**不会**退化为读 cwd 下的 `.grok/config.toml`（避免把不可信项目目录提升为用户层）。
+- TOML 语法错误只报告行列号（`toml_error_detail`），绝不回显可能含密钥的原始源码行。
+- `global_hook_sources` 提供跨项目的全局 hook 源。
+
+### 7.2 认证流程
+
+`xai-grok-shell::auth` 由 `AuthManager` 统一管理：
+
+- **登录流**：OIDC（`auth/oidc`：login/refresh/protocol）与设备码（`device_code`）；`external_auth` / `devbox_login_stub` 支持外部与开发环境登录。
+- **凭据存储**：`credential_provider` + `storage`，token 写入由 `xai-grok-secrets` 脱敏；`bearer_fragment` 处理 Bearer 片段。
+- **刷新链**：`manager/refresh_chain` 串起多个刷新器（`refresh/oidc_refresher`、`refresh/external_refresher`）；`manager/lock` 用文件锁（flock）串行化多进程并发刷新，`sleep_gate` 退避。
+- **修复路径**：`manager/remedy` 处理失效 token 的补救；`recovery` 处理 401 后恢复。
+- **失败策略**：`auth_error_no_retry` 等测试覆盖「认证错误不盲目重试」的语义；采样层的 `attribution` 把 401 归属回具体请求。
+
+### 7.3 Hook 管线
+
+`xai-grok-hooks` 的事件驱动管线：
+
+1. **发现**：`discovery::HookRegistry` 扫描 `~/.grok/hooks/` 与工作树 `.grok/hooks/`。
+2. **解析**：`config::HooksMap` 把事件名 → `MatcherGroup`（未知事件名跳过而非报错）。
+3. **分发**：`dispatcher` 对每个事件按序运行匹配的 hook；`eligible_or_record_skip` 处理禁用/信任禁用；**managed-policy hook 不可被禁用**（管理员策略不能跳过）。
+4. **执行**：`runner/command.rs`（命令 runner）与 `runner/http.rs`（HTTP runner），`GateKind` 区分门控类型，`result.rs` 定义 `HookDecision` / `PromptDecision` 等决策结果。
+5. **信任**：`trust::DisabledHooks` 记录用户/策略禁用集合。
+
+典型事件：`session_start`、`user_prompt_submit`、`pre_tool_use`、`post_tool_use`、`post_tool_use_failure`、`permission_denied`、`stop`/`stop_failure`/`stop_cancelled`、`notification`、`subagent_start`/`subagent_stop`、`pre_compact`/`post_compact`、`session_end`（完整列表见 user-guide `10-hooks.md`）。
 
 ---
 
@@ -433,9 +559,10 @@ flowchart BT
 
 ## 9. 构建与开发提示
 
-- 根 `Cargo.toml` 由构建系统生成，**请勿手动修改**；优先编辑各 crate 的 `Cargo.toml`。
+- 根 `Cargo.toml` 由构建系统生成，**请勿手动修改**；优先编辑各 crate 的 `Cargo.toml`（成员列表由生成脚本维护）。
 - 需要 `rustup` 自动安装 `rust-toolchain.toml` 指定的工具链。
-- `bin/protoc` 通过 DotSlash 解析，构建前确保 `dotslash` 在 `PATH` 上。
+- `bin/protoc` 通过 DotSlash 解析，构建前确保 `dotslash` 在 `PATH` 上；proto 代码生成在 `crates/build/xai-proto-build`。
+- 仓库内嵌第三方源码（`third_party/`，如 Mermaid 图表栈），改动需谨慎对齐上游。
 - 常用命令：
 
 ```bash
@@ -448,10 +575,16 @@ cargo check -p xai-grok-pager-bin
 # 单 crate 测试
 cargo test -p xai-grok-config
 
+# 全工作区测试（耗时较长）
+cargo test --workspace
+
 # 格式化与 lint
 cargo fmt --all
 cargo clippy -p xai-grok-pager-bin
 ```
+
+- 测试组织约定：模块内测试常用 `#[path = "xxx_tests.rs"] mod tests;` 方式外置；`xai-grok-test-support` / `xai-grok-test-utils` 提供共享测试设施；集成测试多在 `tests/` 与 `acp_session_tests/` 下。
+- 调试辅助：`GROK_SUBAGENT_WATERFALL=1` 输出子 Agent 派生标记；`xai-grok-shell/src/bin/test-sampling-server.rs` 可起本地采样测试服务器；`xai-grok-pager-pty-harness` 提供 PTY 端到端测试工具。
 
 ---
 

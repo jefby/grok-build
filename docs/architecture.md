@@ -357,6 +357,26 @@ sequenceDiagram
 4. 父会话通过 `child_tool_projection` 把子 Agent 的工具调用投影回父视图；`prompt_turn_receipt` 记录派生完成的回执。
 5. `waterfall` 模块在 `GROK_SUBAGENT_WATERFALL=1` 时输出单调时钟标记，供回归测试解析。
 
+会话 Recap（`/recap`）与旁路调用：
+
+Recap 是会话级的 "where was I" 摘要，走一条**独立的旁路模型调用**，绝不修改主对话。同属旁路调用的还有 `/btw` 旁路提问（`handle_side_question`）、shell 命令补全（`handle_ai_suggest`）与 Tab 幽灵文本预测（`handle_suggest_prompt`）。
+
+**触发**：手动 `/recap`（`auto=false`，带 loading spinner）或用户离开终端返回时自动触发（`auto=true`）。`extensions/recap.rs` 先过 feature gate（`GROK_SESSION_RECAP` / `[features] session_recap` / remote setting，默认开），然后 fire-and-forget 发送 `SessionCommand::Recap`，立即返回 `{ok:true}`；模型调用在 run loop 中 `spawn_local` 异步执行，结果以 `SessionUpdate::SessionRecap` 通知广播给所有客户端。
+
+**生成流程**（`acp_session_impl/recap.rs` + `helpers/session_recap.rs`）：
+
+1. **快照与取消检测**：先记 `recap_epoch` 再取会话快照；生成期间用户发新 prompt（epoch 变化）即取消展示，避免迟到插入。
+2. **水位线**：`main_turn_count` = 真实用户 prompt 数（排除 `synthetic_reason` 合成消息），持久化于 `{session_dir}/last_recap_main_turn`；压缩/回滚后水位高于当前时自愈回退。
+3. **门控 `recap_gate`**：手动仅需 `main_turns > 0`；自动需**新 turn**、**≥3 个主 turn**、且**空闲 ≥3 分钟**（基于 `last_api_request_at`）。
+4. **防并发**：`recap_in_flight` flag，check-and-set 之间无 await，保证原子性。
+5. **预算裁剪 `budget_recap_items`**：有效窗口 = `min(实际窗口, 500k)`，预算 = 85% × 窗口 − 4000 headroom；放得下走快速路径（保 provider KV 缓存命中），超预算才剥 reasoning、`pop_trailing_tool_run` 截断未完成的尾部 `tool_use`（Anthropic Messages API 拒绝无匹配 `tool_result` 的 `tool_use`）、前裁对话（System 保留、最近 turn 就地截断、绝不空）。
+6. **请求**：`side_call_request` **原样复用主 turn 的 prompt 前缀**（cache-aligned），末尾追加一条 recap 指令——用用户消息的语言、lead with agency（"You asked…" / "We fixed…"）、25–40 词、禁止工具调用与引用 reminder。单次 tool-free 调用（`conversation_collect`），不走 sampler actor 重试预算。
+7. **清理 `clean_recap_text`**：折叠空白成一行 → 剥模型多加的 "Recap —"/"Summary:" 前缀 → 剥对称引号 → 上限 1200 字符（UTF-8 边界截断补 …）。
+8. **提交与广播**：`try_commit_recap`（无 await check-and-set）推进水位 + 清 in-flight；`PersistenceMsg::LastRecap` 将 ≤240 字符预览写入 `summary.json`（列表/`/resume` 展示，与每 turn 的 `last_turn_summary` 不同，last-writer-wins）；最后 `send_xai_notification(SessionRecap{summary, auto})`。
+9. **长尾抑制与 artifact**：auto 模式下 raw 输出 >500 字节或摘要被硬截断 → 只存 artifact 不展示；所有路径（成功/失败/取消）都将发给模型的精确 `ConversationItem` 列表 + summary + raw + error 写入 `{session_dir}/recap_requests/{request_id}.json`（schema v1），随 post-turn 归档上传云端供离线分析。
+
+要点：recap **从不修改会话**，失败全部 best-effort（日志 + 手动路径发 `SessionRecapUnavailable` 清 spinner），同一会话靠水位线去重（每主 turn 至多一次自动 recap）。
+
 #### xai-grok-agent
 
 - 解析 `.grok/agents/*.md` Agent 描述文件。

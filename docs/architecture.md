@@ -660,4 +660,48 @@ cargo clippy -p xai-grok-pager-bin
 
 ---
 
+## 11. 版本演进记录
+
+### 11.1 `d5a0335`（2026-08-31）— 可靠性大修
+
+相比 `70ec060` 的 1 个大型同步提交（`bc7f02ed`），以稳定性/可靠性提升为主：
+
+**可靠性**
+
+- **瞬时采样失败自动重试，不再杀掉整个 turn**：turn 级 transient retry（5xx/流抖动），带 fleet 可观测性（`xai-grok-sampler` 新增 `request_metadata`）。
+- **Length-truncated 轮次执行已完成工具调用**：模型输出被截断（`max_prompt_tokens` / `max_time_limit`，拆分处理并保留 `raw_stop_reason`）时，已完成调用的工具照常执行而非整轮失败。
+- **调度器**：保留完整 task UUID；已完成的循环任务正确停止。
+- **安全修复**：sandbox 下 SessionStart hook 经 config.toml 持久化导致非沙箱执行的漏洞已修复。
+- **压缩错误**：透出真实原因，不再裸 "Compaction failed."。
+
+**功能增强**
+
+- **Hook 门控**：PreToolUse 支持 `ask`（直接询问用户）、`defer`（延迟决策）与 `additionalContext`（注入工具调用上下文）。
+- **MCP**：服务器无批量上限并发启动；OAuth 移出 session spawn 路径（会话启动不被 MCP 认证阻塞）。
+- **图片**：钳制到 2000px（即使重编码不缩字节）。
+- **插件**：document context 以结构化输入发送。
+- **安装包下载**：zstd/gzip 压缩（`grok update` 更快）。
+- **Windows**：单一 home 解析器修复（`xai-dirs::home_dir`，agent 能正确打开 `~/.grok`）。
+- **`/gboom`** 彩蛋独立成 `xai-grok-gboom` crate（kitty 图形协议，非生产代码）。
+
+**内部重构**
+
+- `input/`、`search/` 从 `xai-grok-pager` 迁入 `xai-grok-pager-render`。
+- 删除死代码：从未接线的 worktree pool、relocation 事务机制、wrapper layer、dashboard vestiges、重复测试。
+- `slash_meta!` 宏收敛斜杠命令静态元数据；模型目录单一 URL/fetch 来源。
+- 删除 dev 二进制 `test-sampling-server` / `test_multipart_upload`。
+
+### 11.2 `70ec060`（2026-08-27）— 功能大版本
+
+相比 `7cfcb20`（36 个同步提交），主要新增：
+
+- **Goal 模式**（`/goal`）：自驱目标会话，预算控制 + 对抗式验证（详见 §6.2）。
+- **后台工作流**（`/workflow runs`）：多 Agent 分阶段并行执行（详见 §5.5）。
+- **沙箱模式**（`--sandbox workspace|read-only|strict|devbox`）：Landlock/Seatbelt 内核级隔离。
+- **Agent Dashboard**（`grok dashboard` / `/dashboard`）：会话总览、接管、派发（详见 §6.4）。
+- **状态行**（`[ui.status_line]`）与**会话全文检索**（SQLite FTS5，`grok sessions search`）。
+- **新增 16 个 crate**：`xai-workflow`、`xai-grok-dashboard-store`、`xai-grok-sandbox`、`xai-grok-session-search`、`xai-grok-status-line`、`xai-grok-session-events`、`xai-grok-active-sessions`、`xai-grok-foreign-sessions`、`xai-grok-bundle`、`xai-grok-extra-ca`、`xai-grok-shell-terminal`、`xai-grok-pager-diff`、`xai-compaction-transcript`、`xai-prompt-queue`、`xai-grok-diag-server`、`xai-grok-workspace-daemon`、`xai-grok-plugin-marketplace`、`xai-fuzzy-file-search`、`xai-dirs`（`xai-grok-home` 更名）等；common 侧新增 `xai-computer-hub-*`、`xai-grok-compaction`、`xai-tool-protocol`。
+
+---
+
 *文档生成时间：2026-08-31（已合并上游 `upstream/main` @ `d5a0335`）*

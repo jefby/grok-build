@@ -717,4 +717,53 @@ cargo clippy -p xai-grok-pager-bin
 
 ---
 
+## 12. 设计特色：与轻量 harness（pi）的对比
+
+> 说明：以下对比基于 Grok Build 源码的观察，对照方为 pi 这类轻量通用 harness（"够用就好"哲学）。模型相同的情况下，体感差距主要来自壳（harness）的设计投入——上下文经济性、失败语义、可观测性。
+
+### 12.1 旁路调用（side-call）设计
+
+recap、`/btw`、Tab 补全等"次要模型调用"被设计成一套精密的独立通道：
+
+- **原样复用主 turn 的 prompt 前缀**（cache-aligned）→ provider KV 缓存命中，额外调用几乎不增加首 token 延迟。
+- **绝不修改主会话**：快照 + 独立 instruction，失败全部 best-effort。
+- **预算裁剪**：85% 窗口 + 4000 headroom + 500k cap，超预算才剥 reasoning/前裁；快照放得下绝不碰。
+- **epoch 取消检测**：生成期间用户发了新 prompt，结果直接丢弃不展示（不"迟到"插进对话）。
+- 每次调用落 artifact（`recap_requests/{id}.json`）供离线分析。
+
+朴素实现（直接再发一个请求）没有这套缓存对齐 + 取消 + 预算 + 可审计机制。
+
+### 12.2 持久化架构：写路径与主循环彻底分离
+
+- 独立 **persistence actor + mpsc 通道**：`PersistenceMsg` 串行落盘，会话主循环永不被磁盘 IO 阻塞。
+- 磁盘格式**权威源 + 索引分离**：`updates.jsonl`（内容真相）+ `summary.json`（列表索引）+ 附属小文件（rewind/signals/feedback）。
+- **破坏性改写"先备份后重写"**（image strip 的 `ReplaceChatHistoryForStripAndAck`）：备份落盘成功才允许销毁原历史。
+- `StrictAppendAck` 严格追加语义——写失败能明确区分"没写"和"不确定"。
+
+### 12.3 容错哲学：显式 fail-open / fail-closed 语义
+
+每个旁路/子流程都显式声明失败语义：
+
+- planner **fail-closed**（失败就暂停 goal）；strategist **fail-open**（失败只记日志，绝不影响主循环）。
+- 验证器 **FailOpen 回滚**（验证基础设施挂了就回滚 attempt，绝不误判"目标达成"）。
+- 瞬时采样失败**重试不杀 turn**；截断轮次**执行已完成工具调用**——"能救的绝不丢"。
+
+### 12.4 配置分层与安全细节
+
+- 五层配置（用户/托管×2/requirements/MDM）各有优先级和签名校验。
+- **无家目录时不读 cwd 下 `.grok/config.toml`**——防止不可信项目目录被提升为用户层（权限边界）。
+- TOML 语法错误只报行列号，**绝不回显可能含密钥的源码行**。
+- `xai-grok-secrets` 统一脱敏。
+
+### 12.5 状态机工程（Goal 模式）
+
+8 态状态机（含 5 种**带原因**的暂停态）、15 种事件历史、水位线去重、serde alias 兼容旧序列化——不是"能跑就行"，是正经的状态机设计。
+
+### 12.6 测试工程
+
+- 测试文件外置（`#[path]`）+ 事故驱动回归测试命名（SEV-576、deflake）。
+- PTY 端到端 harness、`GROK_SUBAGENT_WATERFALL` 单调时钟标记供回归测试解析。
+
+---
+
 *文档生成时间：2026-08-31（已合并上游 `upstream/main` @ `d5a0335`）*

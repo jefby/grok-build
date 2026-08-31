@@ -472,6 +472,19 @@ Goal 模式（`/goal`）：
 
 触发路径：上下文窗口超限自动触发（`CompactAndResubmit`）、手动 `/compact`、以及 `compaction_checkpoints/` 保存点恢复。
 
+**自动压缩（Auto-Compact）**：默认开启——上下文用到窗口 **85%**（`auto_compact_threshold_percent`，可每模型配置 `model.<id>.auto_compact_threshold_percent` 0-100 或 `model.<id>.compaction_at_tokens` 直接用 token 数指定）时，采样路径（`sampler_turn.rs`）检测超阈值 → `run_compact_only` → 返回 `SamplerFailureRecovery::CompactAndResubmit`——压缩后**自动重新提交请求**，整个 turn 继续，用户无感。其他配置：`features.two_pass_compaction`（默认开）、`features.compaction_detail`（segments 保留细节）、`GROK_COMPACTION_MODE` 等环境变量。
+
+**失败抑制分级**（`compaction_config.rs`，失败不傻重试）：
+
+| 级别 | 语义 |
+|------|------|
+| `SUPPRESS_TURN` | 可恢复错误 → 本轮抑制，**下轮 turn 开始时自愈** |
+| `SUPPRESS_STICKY` | 致命（大小/schema 坏）→ 重试无意义，只有**预算变化**才清（成功压缩 / rewind / 换模型） |
+| `SUPPRESS_UNTIL_SUCCESS` | 信用不足 → 等到模型返回 200 |
+| `SUPPRESS_AUTH` | 认证过期 → 等登录/刷新（**不是等 200**——上下文已超窗时等采样会死锁） |
+
+配套：手动 `/compact`；segments 模式落盘 `compaction/` 干净 markdown + `compaction_checkpoints/` 保存点，rewind 缩小上下文后自动解除抑制；`compaction_verbatim_input`（默认开）关键输入原样保留。
+
 #### xai-grok-memory
 
 - Markdown 格式跨会话记忆，存储于 `~/.grok/memory/`。

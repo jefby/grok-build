@@ -2,7 +2,7 @@
 
 > 本文件基于仓库 `crates/` 下源码结构、根 `Cargo.toml` 以及 `README.md` 整理，描述 Grok Build（`grok` CLI/TUI）的整体架构、核心数据流与 crate 职责。
 >
-> 已跟随上游最新代码（`upstream/main` @ `70ec060`，合并提交 `2d735d3`）更新。
+> 已跟随上游最新代码（`upstream/main` @ `d5a0335`，合并提交 `32817aa`）更新。
 
 ---
 
@@ -219,7 +219,7 @@ flowchart LR
 2. **Request build**：`ChatStateHandle::build_request` 组装历史消息与工具定义；涉及 image budget 等上下文预算控制。
 3. **Sampling**：`xai-grok-sampler` 采用三层 API——`SamplingClient`（原始 chunk 流）→ `stream` 变换（`stream_chat_completions` / `stream_responses` / `stream_messages`）→ `SamplerHandle`（actor 化：重试、取消、事件协调）。支持 401 归属（`attribution`）与 doom-loop 恢复。
 4. **Tool execution**：`execute_tool_calls` 并发调度；同一路径写操作串行化；`tool_dispatch.rs` 负责权限门控后的实际分发。
-5. **Recovery**：401 触发 `RefreshAuthAndResubmit`（走 `AuthManager` 刷新链）；上下文窗口超限触发 `CompactAndResubmit`（按 `CompactionMode` 落盘压缩段）。
+5. **Recovery**：401 触发 `RefreshAuthAndResubmit`（走 `AuthManager` 刷新链）；上下文窗口超限触发 `CompactAndResubmit`（按 `CompactionMode` 落盘压缩段）；Length-truncated 轮次（`max_prompt_tokens` / `max_time_limit`）**先执行已完成工具调用**再结束，而非直接失败。
 
 完整的 turn 内部步骤：
 
@@ -294,7 +294,7 @@ sequenceDiagram
 | `app::agent_view` | 单个 Agent 的视图模型（会话 + UI 状态） |
 | `app::actions` | `Action` / `Effect` / `TaskResult` 事件流骨架 |
 | `scrollback` | 滚动回显：消息块、搜索、选择 |
-| `input` | 键盘输入归一化、行编辑器、鼠标滚动 |
+| `input` | 键盘输入归一化、行编辑器、鼠标滚动（**已随上游迁移至 `xai-grok-pager-render`**） |
 | `views` | 提示框、设置、仪表板、模态框等 Widget |
 | `acp` | ACP 连接、Leader 桥接、重连恢复 |
 | `dashboard` | Agent Dashboard：会话总览、接管、派发 |
@@ -320,6 +320,7 @@ sequenceDiagram
 - `AppView` 计算脏区域 → `Presenter::request` → ratatui 绘制；Markdown/Mermaid 通过后台 worker（`mermaid_worker`）异步渲染。
 - 图像支持：`image_overlay` / `inline_media_ffmpeg`（ffmpeg 转码内联媒体）。
 - diff 渲染：`xai-grok-pager-diff` 把编辑工具输出转成行级 `DiffHunk`。
+- 上游 `bc7f02ed` 起，`input/`（键盘归一化、行编辑器）与 `search/`（会话/内容搜索）从 `xai-grok-pager` **整体迁入本 crate**；pager 侧同步清理了 wrapper layer 与 dashboard vestiges 等死代码。
 
 ### 6.2 运行时层：xai-grok-shell / xai-grok-agent
 
@@ -503,7 +504,7 @@ Agent Dashboard（`grok dashboard` / `/dashboard` / `Ctrl+\`）：列出本进�
 |-------|------|
 | `xai-grok-config` | 合并 `config.toml`、`managed_config.toml`、`requirements.toml` 及 MDM 偏好；Ed25519 签名策略校验；env overlay、版本覆盖、全局 hook 源 |
 | `xai-grok-config-types` | 配置相关的纯数据类型（flags、memory、MCP、权限、pool、dashboard） |
-| `xai-dirs` | 家目录 / `GROK_HOME` 解析（`USERPROFILE` 优先、dunce 规范化、进程级缓存）；由原 `xai-grok-home` 更名而来 |
+| `xai-dirs` | 家目录 / `GROK_HOME` 解析；`home_dir()` 是**唯一** home 解析入口（`std::env::home_dir`：Unix `HOME`、Windows `USERPROFILE`，不用 `dirs` 的 known-folder API，避免 `~/.grok` 与其他点目录落在不同树）；dunce 规范化、进程级缓存、`GrokHomeSource` 溯源；由原 `xai-grok-home` 更名而来 |
 | `xai-grok-auth` | 认证抽象：`AuthCredentialProvider`、`HttpAuth`；OIDC/设备码流、刷新链、锁与并发刷新 |
 | `xai-grok-http` | 进程级共享 `reqwest` 客户端、User-Agent 构造 |
 | `xai-grok-telemetry` | 产品事件、Mixpanel、Sentry、OpenTelemetry、会话指标、进程身份（入口点/交互性） |
@@ -524,6 +525,7 @@ Agent Dashboard（`grok dashboard` / `/dashboard` / `Ctrl+\`）：列出本进�
 | `xai-tool-protocol` / `xai-tool-runtime` / `xai-tool-types` | Computer Hub 线协议（含 bot-relay 帧）、工具服务器运行时与共享类型 |
 | `xai-computer-hub-core` / `xai-computer-hub-mcp-adapter` / `xai-computer-hub-sdk` | Computer Hub 核心、MCP 适配、SDK（连接池、WebSocket 复用、重连回放） |
 | `xai-grok-compaction` / `xai-interjection-core` / `xai-circuit-breaker` / `xai-tracing` | 传输无关压缩核心、打断（interjection）核心、熔断、tracing |
+| `xai-message-delivery-core` | 源类型化消息投递与操作授权（`DeliveryEnvelope` / `Principal` / `authorize_operation`），prompt queue 的父级投递基础 |
 
 ### 7.1 配置分层与合并顺序
 
@@ -631,7 +633,7 @@ cargo clippy -p xai-grok-pager-bin
 ```
 
 - 测试组织约定：模块内测试常用 `#[path = "xxx_tests.rs"] mod tests;` 方式外置；`xai-grok-test-support` / `xai-grok-test-utils` 提供共享测试设施；集成测试多在 `tests/` 与 `acp_session_tests/` 下。
-- 调试辅助：`GROK_SUBAGENT_WATERFALL=1` 输出子 Agent 派生标记；`xai-grok-shell/src/bin/test-sampling-server.rs` 可起本地采样测试服务器；`xai-grok-pager-pty-harness` 提供 PTY 端到端测试工具。
+- 调试辅助：`GROK_SUBAGENT_WATERFALL=1` 输出子 Agent 派生标记；`xai-grok-shell/src/bin/chat-history-downgrade.rs` 是数据管线工具（`chat_history.jsonl` v1→v0 归一化）；`xai-grok-pager-pty-harness` 提供 PTY 端到端测试工具；`/gboom` 彩蛋独立成 `xai-grok-gboom` crate（kitty 图形协议终端游戏，非生产代码）。
 
 ---
 
@@ -658,4 +660,4 @@ cargo clippy -p xai-grok-pager-bin
 
 ---
 
-*文档生成时间：2026-08-27（已合并上游 `upstream/main` @ `70ec060`）*
+*文档生成时间：2026-08-31（已合并上游 `upstream/main` @ `d5a0335`）*

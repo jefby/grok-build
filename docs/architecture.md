@@ -2,7 +2,7 @@
 
 > 本文件基于仓库 `crates/` 下源码结构、根 `Cargo.toml` 以及 `README.md` 整理，描述 Grok Build（`grok` CLI/TUI）的整体架构、核心数据流与 crate 职责。
 >
-> 已跟随上游最新代码（`upstream/main` @ `d5a0335`，合并提交 `32817aa`）更新。
+> 已跟随上游最新代码（`upstream/main` @ `a549186`，合并提交 `3a1269c`）更新。
 
 ---
 
@@ -339,7 +339,7 @@ sequenceDiagram
 | `tools` | 对 `xai-grok-tools` 的薄封装 |
 | `relay` / `remote` | Relay WebSocket 与远程工作区连接 |
 | `claude_import` | Claude Code 会话/记忆导入 |
-| `managed_config` | 托管配置（团队/企业）管理与签名校验 |
+| `managed_config` | 托管配置（团队/企业）管理与签名校验；`managed_config/` 目录化：`store.rs`（按 principal 同步 `managed_config.toml` + `requirements.toml`，身份切换驱逐、登出清除）+ `supervisor.rs` + `policy.rs`（managed MCP/plugin/marketplace 策略引擎） |
 | `mcp_doctor` | MCP 服务器诊断 |
 | `waterfall` | 子 Agent 派生流水线的测试标记（`GROK_SUBAGENT_WATERFALL`） |
 
@@ -523,7 +523,7 @@ Agent Dashboard（`grok dashboard` / `/dashboard` / `Ctrl+\`）：列出本进�
 | `xai-grok-telemetry` | 产品事件、Mixpanel、Sentry、OpenTelemetry、会话指标、进程身份（入口点/交互性） |
 | `xai-grok-secrets` | 敏感信息脱敏：token、用户路径、URL 敏感部分 |
 | `xai-grok-extra-ca` | TLS 策略：OS 根 + Mozilla 根 + 可选 `GROK_EXTRA_CA_BUNDLE` 额外根，固定 rustls |
-| `xai-grok-mcp` | MCP 服务器隔离运行、OAuth、transport、工具调用（隔离 `rmcp` 与 `reqwest` 版本） |
+| `xai-grok-mcp` | MCP 服务器隔离运行、OAuth、transport、工具调用（隔离 `rmcp` 与 `reqwest` 版本）；支持 2026-07-28 elicitation（多轮往返请求）与 bind-time MCP 服务器；OAuth 认证移出 session spawn 路径 |
 | `xai-grok-hooks` | `~/.grok/hooks/` 与工作树 `.grok/hooks/` 的 hook 系统（command/http runner、trust、matcher） |
 | `xai-grok-subagent-resolution` | 子 Agent 启动规范解析与 resume identity 校验 |
 | `xai-grok-voice` | 流式语音听写 |
@@ -766,4 +766,36 @@ recap、`/btw`、Tab 补全等"次要模型调用"被设计成一套精密的独
 
 ---
 
-*文档生成时间：2026-08-31（已合并上游 `upstream/main` @ `d5a0335`）*
+## 13. 版本演进记录（续）
+
+### 13.1 `a549186`（2026-09-03）— 协议与托管策略
+
+相比 `d5a0335` 的 2 个同步提交（`bb7f39d5` + `72a61251`）：
+
+**协议 / MCP**
+
+- **ACP `session/set_config_option`**：运行时设置会话配置项；`session/new` 在 spawn 时即应答。
+- **MCP 2026-07-28 elicitation**：多轮往返请求；**bind-time MCP 服务器**；MCP OAuth 死锁修复（`/mcps auth`）。
+- bot relay 白名单 `setAgentNotificationsEnabled` / avatar 命令；广告 bot 工具参数 schema。
+
+**托管策略引擎**
+
+- `managed_config` 单文件重构为目录（`store.rs` / `supervisor.rs` / `policy.rs`）：按 principal 同步 `managed_config.toml` + `requirements.toml`，身份切换驱逐、登出清除；新增 **managed MCP / plugin / marketplace 策略引擎**（`ManagedPolicyRefusal`）。
+- **签名 `requirements.toml` 可 pin 可选模型**（`inspect` 支持命名策略结果、pin reason 枚举）。
+
+**启动与缓存优化**
+
+- 启动共享**一次** settings fetch（`startup_prefetch` + cache-first `/settings`，热启动跳过网络）。
+- **agent spawn 时预预热 auth refresh**、**session create 时预预热采样 transport**（`sampler_prewarm`）。
+- Windows CLI 构建 zstd/gzip sidecar 压缩。
+
+**会话 / 调度**
+
+- 压缩后**重新注入 scheduled loops 与 live workflows**；恢复时 transcript 适配窗口才 resume（`resume_window.rs`）。
+- scheduler：循环 task UUID 保留短横线；`get-output` 等待上限 1 小时。
+- **Steer** 在下一个安全点接管 owned 子 Agent；exit dream 移出 session-close 路径（不阻塞关闭）。
+- prompt-suggestion 远端旋钮 + 安静 ghost text；`length_salvage` 由 remote setting 控制；token 用量上报改为 coordinator 通知（去掉轮询）。
+
+---
+
+*文档生成时间：2026-09-03（已合并上游 `upstream/main` @ `a549186`）*

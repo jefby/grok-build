@@ -578,6 +578,16 @@ Agent Dashboard（`grok dashboard` / `/dashboard` / `Ctrl+\`）：列出本进�
 
 典型事件：`session_start`、`user_prompt_submit`、`pre_tool_use`、`post_tool_use`、`post_tool_use_failure`、`permission_denied`、`stop`/`stop_failure`/`stop_cancelled`、`notification`、`subagent_start`/`subagent_stop`、`pre_compact`/`post_compact`、`session_end`（完整列表见 user-guide `10-hooks.md`）。
 
+**pre_tool_use 门控决策**（`result.rs` / `runner/command.rs`）：
+
+- 门控出口四态：`Allow` / `Ask` / `Defer` / `Deny`；命令 runner 解析 JSON 决策（exit 0 = allow，exit 2 = deny 且 stdout 被忽略，`updatedInput` 可重写工具输入）。
+- **`Ask`**：hook 请求**直接询问用户**而非静默放行/拒绝——`GateOutcome::Ask { additional_context }` 沿 runner → dispatcher → shell（`hook_dispatch.rs`）上抛，由权限层弹出用户确认。
+- **`Defer`**：延迟决策到后续时机。
+- **`additionalContext`**：hook 携带的结构化上下文，注入本次工具调用（与 ask 决策一同传递）。
+- **managed-policy hook**：由管理员策略定义，不可被用户禁用/跳过。
+
+消费端接线：`xai-grok-shell` 侧 `extensions/hooks.rs`（会话扩展）+ `session/acp_session_impl/hook_dispatch.rs`（turn 内 `pre_tool_use` 等在工具执行前的门控点）；用户文档见 `xai-grok-pager/docs/user-guide/10-hooks.md`。
+
 ---
 
 ## 8. 依赖与层次关系

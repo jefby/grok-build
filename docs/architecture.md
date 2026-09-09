@@ -2,7 +2,7 @@
 
 > 本文件基于仓库 `crates/` 下源码结构、根 `Cargo.toml` 以及 `README.md` 整理，描述 Grok Build（`grok` CLI/TUI）的整体架构、核心数据流与 crate 职责。
 >
-> 已跟随上游最新代码（`upstream/main` @ `a549186`，合并提交 `3a1269c`）更新。
+> 已跟随上游最新代码（`upstream/main` @ `eb4a894`，合并提交 `3bc11ae`）更新。
 
 ---
 
@@ -533,6 +533,10 @@ Agent Dashboard（`grok dashboard` / `/dashboard` / `Ctrl+\`）：列出本进�
 | `xai-compaction-transcript` | 压缩段 → 自包含 Markdown 的纯渲染（对齐 Python 压缩实现） |
 | `xai-prompt-queue` | 提示队列线格式与合并规则 |
 | `xai-crash-handler` | 崩溃捕获、符号化、终端恢复 |
+| `xai-grok-feedback` | 共享反馈分类、结构化元数据、持久化 draft 存储与（带容量上限的）会话 trace 归档（`eb4a894` 从 shell 抽出） |
+| `xai-grok-image` | 全像素图像解码（CRC/IDAT 损坏检测，非仅头部检查） |
+| `xai-grok-login` | 登录流程（从 shell 抽出） |
+| `xai-grok-otel` | OpenTelemetry OTLP provider（otlp/provider 模块） |
 | `xai-fuzzy-file-search` | 基于 `ignore` + `nucleo` 的模糊文件搜索 |
 | `xai-sqlite-journal` / `xai-token-estimation` / `xai-tty-utils` 等 | 工具叶子：WAL 日志模式、token 估算、tty 工具 |
 | `xai-tool-protocol` / `xai-tool-runtime` / `xai-tool-types` | Computer Hub 线协议（含 bot-relay 帧）、工具服务器运行时与共享类型 |
@@ -806,6 +810,31 @@ recap、`/btw`、Tab 补全等"次要模型调用"被设计成一套精密的独
 - **Steer** 在下一个安全点接管 owned 子 Agent；exit dream 移出 session-close 路径（不阻塞关闭）。
 - prompt-suggestion 远端旋钮 + 安静 ghost text；`length_salvage` 由 remote setting 控制；token 用量上报改为 coordinator 通知（去掉轮询）。
 
+### 13.2 `eb4a894`（2026-09-08）— 交互打磨与可靠性
+
+**TUI / 交互**
+
+- 启动优化：首个交互帧报告 TUI 就绪；client 应答先于 skills 扫描；启动计时拆解；共享 HTTP client 预热。
+- **Esc 不再取消运行中的 turn**（改为提示 Ctrl+C）；Shift+J/K 跳 turn；`[edit]` 标记与 `Send now` 恢复（auto-wake 期间）。
+- queued follow-ups 穿过 waits 保持；minimal-mode reasoning rail 重绘；URL 表格换行保持完整；Dashboard 统一 header + actions 行。
+- 后台任务 viewer 可从 jump control 打开（无需 scrollback anchor）；调度器唤醒询问用户 fix/delete/update 定时任务。
+
+**安全 / 信任**
+
+- **项目指令与 skills 受 folder trust 门控**；auto 模式 git 常规操作用 **fail-closed allowlist**。
+- vendor hook settings 路径做目录类型门控；mode-000 路径权限拒绝不再误判为 sandbox spoof。
+- `DISABLE_TELEMETRY` 生效；测试/开发构建遥测不上生产目的地。
+
+**子 Agent / 调度**
+
+- 子 Agent **按 attempt 跟踪生命周期**并赋 attempt id；完成通知包含 command/子 Agent 输出；send 命中已结束子 Agent 时唤醒同一 agent；wake turn 为每个结束的子 Agent 交付一份 digest。
+
+**编辑 / 工具**
+
+- `edit_file` diff **锚定真实文件行号**；`/compact` 指令转发至压缩流程；工具遥测包含模型 ID。
+
+**新 crate**：`xai-grok-feedback`（反馈分类/结构化元数据/draft 持久化/会话 trace 归档）、`xai-grok-image`（全像素解码，CRC/IDAT 校验）、`xai-grok-login`、`xai-grok-otel`（OpenTelemetry OTLP provider）——多为从 shell/telemetry 抽出的共享代码。
+
 ---
 
-*文档生成时间：2026-09-03（已合并上游 `upstream/main` @ `a549186`）*
+*文档生成时间：2026-09-08（已合并上游 `upstream/main` @ `eb4a894`）*

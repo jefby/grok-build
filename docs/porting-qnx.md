@@ -3,7 +3,7 @@
 > 目标平台：**QNX 8.0 / aarch64**（Rust target `aarch64-unknown-nto-qnx800`）
 > 分析基准：本仓库 `upstream/main` @ `37949780`（源 rev `eb4a894`）
 > 说明：文中"实测数据"来自对 `crates/` 源码与 `Cargo.{toml,lock}` 的统计；标注 **[待实测]** 的条目必须在真实 QNX SDP 8.0 环境上验证后再决策。
-> 架构背景见 [`architecture.md`](./architecture.md)；mio 后端的深入设计见 [`porting-qnx-mio.md`](./porting-qnx-mio.md)。
+> 架构背景见 [`architecture.md`](./architecture.md)；mio 后端的深入设计见 [`porting-qnx-mio.md`](./porting-qnx-mio.md)；子进程 / `tokio::process` 层见 [`porting-qnx-process.md`](./porting-qnx-process.md)。
 
 ---
 
@@ -51,6 +51,8 @@
 - `xai-grok-shell` 的 **Leader/Follower Unix socket** IPC
 - `xai-chat-state` / `xai-grok-session-events` 的 **JSONL 持久化**（`updates.jsonl` 等）
 - `xai-grok-sandbox`、`xai-grok-hooks`、`xai-grok-memory` 的**优雅降级默认语义**（见 §6.4）
+
+> 📖 **子进程层深入阅读**：`tokio::process` 在 QNX 上的走向（pidfd vs orphan queue）、`pre_exec` + `PR_SET_PDEATHSIG` 这对 Linux 专属写法、QNX 无 `prctl` 的替代方案、PTY 与 `/proc` 依赖、分层探针计划，见 **[`porting-qnx-process.md`](./porting-qnx-process.md)**。
 
 ---
 

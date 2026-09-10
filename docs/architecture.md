@@ -2,7 +2,7 @@
 
 > 本文件基于仓库 `crates/` 下源码结构、根 `Cargo.toml` 以及 `README.md` 整理，描述 Grok Build（`grok` CLI/TUI）的整体架构、核心数据流与 crate 职责。
 >
-> 已跟随上游最新代码（`upstream/main` @ `eb4a894`，合并提交 `3bc11ae`）更新。
+> 已跟随上游最新代码（`upstream/main` @ `37949780`，合并提交 `58753ea`）更新。
 
 ---
 
@@ -487,10 +487,19 @@ Goal 模式（`/goal`）：
 
 #### xai-grok-memory
 
+**Legacy（v1）**
+
 - Markdown 格式跨会话记忆，存储于 `~/.grok/memory/`。
 - 基于 SQLite + `sqlite-vec`（vec0 虚拟表 KNN 搜索）的向量搜索与嵌入（`embedding::ApiEmbeddingProvider`）。
 - 文件监听自动同步记忆索引（`MemoryFileWatcher`）；`chunker` 分块、`mmr` 相关性重排、`archive` 归档。
 - `dream` 模块负责记忆的周期性整理/回放（`dream_lock` 防止并发）。
+
+**v2（隔离管道，`eb4a894`/`37949780` 引入）**
+
+- **完全隔离的磁盘基础**（`v2.rs`）：v2 **从不**读写 legacy `memory/` 树；每个 global 或 workspace scope 各自持有 topics、**不可变 observation inbox**、archive、生成的 manifest、持久化 state database 与 lexical index。
+- **durable observation capture**（`v2_capture.rs`）与安全文件枚举（`storage_v2.rs`，只暴露经受控列举的文件）。
+- 检索来源区分（`observation.rs` 的 `MemorySearchSource`：`Tool` / `Injection` / `CompactionRecovery`）与 `MemoryRetrievalMode`；新增 `query_expansion`、`schema`。
+- 配套安全契约：isolated memory filesystem（工具侧 `memory_v2.rs`）。
 
 #### 工作流与 Dashboard
 
@@ -835,6 +844,32 @@ recap、`/btw`、Tab 补全等"次要模型调用"被设计成一套精密的独
 
 **新 crate**：`xai-grok-feedback`（反馈分类/结构化元数据/draft 持久化/会话 trace 归档）、`xai-grok-image`（全像素解码，CRC/IDAT 校验）、`xai-grok-login`、`xai-grok-otel`（OpenTelemetry OTLP provider）——多为从 shell/telemetry 抽出的共享代码。
 
+### 13.3 `37949780`（2026-09-09）— 记忆 v2 与启动可观测
+
+**记忆 v2（最重要的新功能）**
+
+- 全新的**隔离记忆管道**：v2 磁盘基础与 legacy `memory/` 树完全隔离，每个 global/workspace scope 拥有自己的 topics、不可变 observation inbox、archive、manifest、state database 与 lexical index（详见 §6.4）。
+- durable v2 observation capture、安全的 v2 文件工作流与受控文件枚举、isolated memory filesystem 契约文档化。
+
+**启动与性能**
+
+- 新增 startup spans：session create / spawn / prefetch / git scan / replay / bootstrap；启动 settings fetch 收敛为**单一 owner**。
+- 修复 startup cache 与 settings loading；`/resume` 在忘了 `--continue` 后清理无用 home husk。
+- **OpenTelemetry histogram**：导出 turn 级 time-to-first-token 与 time-to-first-message。
+
+**架构整合**
+
+- **session 与 extensions 解耦**；MCP 启动所有权整合（consolidate）；workspaced 控制 socket 与 agent-host prompt/load 文档化。
+- workflow run 新增 pause/stop 来源（agent 可控制自己的工作流运行）；子 Agent attempt minting 与 wake 胶水移至各自归属的 crate。
+
+**安全与体验**
+
+- 拒绝 ripgrep `--hostname-bin` 在 always-safe / Auto 常规路径；SVG PNG 缩略图不再污染对话 turn。
+- **Hooks UI**：成功时静默、hook 阻塞 turn 时显示状态行、失败时一行提示。
+- Dashboard：←/→ 浏览 actions row，Enter 等效点击；header 与 actions-row 装饰抽离。
+- 语音听写（CLI/TUI）在光标位置插入；bash 模式显示完整 UI 输出；设置单选支持双击。
+- 主题别名在 `/theme` 选择器中可匹配；bot relay 允许 listener connect 命令。
+
 ---
 
-*文档生成时间：2026-09-08（已合并上游 `upstream/main` @ `eb4a894`）*
+*文档生成时间：2026-09-09（已合并上游 `upstream/main` @ `37949780`）*

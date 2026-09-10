@@ -3,7 +3,8 @@
 > 目标平台：**QNX 8.0 / aarch64**（Rust target `aarch64-unknown-nto-qnx800`）
 > 分析基准：本仓库 `upstream/main` @ `37949780`（源 rev `eb4a894`）
 > 说明：文中"实测数据"来自对 `crates/` 源码与 `Cargo.{toml,lock}` 的统计；标注 **[待实测]** 的条目必须在真实 QNX SDP 8.0 环境上验证后再决策。
-> 架构背景见 [`architecture.md`](./architecture.md)；mio 后端的深入设计见 [`porting-qnx-mio.md`](./porting-qnx-mio.md)；子进程 / `tokio::process` 层见 [`porting-qnx-process.md`](./porting-qnx-process.md)。
+> 架构背景见 [`architecture.md`](./architecture.md)。
+> **移植专题文档**（建议从索引入）：[`porting-qnx-index.md`](./porting-qnx-index.md) —— mio 后端 [`porting-qnx-mio.md`](./porting-qnx-mio.md)、子进程 [`porting-qnx-process.md`](./porting-qnx-process.md)、PTY/终端 [`porting-qnx-pty.md`](./porting-qnx-pty.md)、文件事件 [`porting-qnx-fsevents.md`](./porting-qnx-fsevents.md)、TLS/加密 [`porting-qnx-tls.md`](./porting-qnx-tls.md)。
 
 ---
 

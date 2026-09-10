@@ -3,7 +3,7 @@
 > 目标平台：**QNX 8.0 / aarch64**（Rust target `aarch64-unknown-nto-qnx800`）
 > 分析基准：本仓库 `upstream/main` @ `37949780`（源 rev `eb4a894`）
 > 说明：文中"实测数据"来自对 `crates/` 源码与 `Cargo.{toml,lock}` 的统计；标注 **[待实测]** 的条目必须在真实 QNX SDP 8.0 环境上验证后再决策。
-> 架构背景见 [`architecture.md`](./architecture.md)。
+> 架构背景见 [`architecture.md`](./architecture.md)；mio 后端的深入设计见 [`porting-qnx-mio.md`](./porting-qnx-mio.md)。
 
 ---
 
@@ -106,6 +106,8 @@ QNX 属于 `cfg(unix)`，因此所有 `[target.'cfg(unix)'.dependencies]` 中的
 - 改动散布在 50 个 crate，成本**远大于**方案 A
 
 > **决策建议**：A 为主。先用 spike 验证可行性 —— 在 QNX aarch64 上跑通一个最小 tokio TCP echo server，这是整个项目的"探针"。
+
+> 📖 **深入阅读**：mio 后端的接入点（四个模块 / `Selector` trait）、四个方案对比、`poll()` 后端的**八个实现难点**（`POLLNVAL` 清理、亚毫秒超时取整、self-pipe waker 等）、tokio 侧验证点、`poll_qnx.rs` 实现骨架与核对清单，见 **[`porting-qnx-mio.md`](./porting-qnx-mio.md)**。
 
 ### 4.2 文件事件 → `ionotify` 或轮询
 

@@ -1,5 +1,9 @@
 # QNX 移植深入：PTY 与终端层分析
 
+> ⚠️ **前提修正（重要）**：本篇只在**交互式终端 / TUI** 目标下需要。若目标是**后台 agent 进程**（`grok agent stdio|serve|leader|headless`），**本工作包整个可跳过** —— 因为命令执行走的是 **pipe 而非 PTY**。
+>
+> 参见 [`porting-qnx-index.md`](./porting-qnx-index.md) §0（目标形态先行）。
+
 > 配套文档：[`porting-qnx.md`](./porting-qnx.md)（总览）、[`porting-qnx-mio.md`](./porting-qnx-mio.md)、[`porting-qnx-process.md`](./porting-qnx-process.md)
 > 分析基准：`portable-pty 0.9.0`、`alacritty_terminal 0.26.0`、`crossterm 0.28`、`ratatui 0.29`、`vte 0.15.0`
 > 标 **[待实测]** 处需在真实 QNX SDP 8.0 验证；标 **[核对]** 处需对照依赖源码。
@@ -8,14 +12,29 @@
 
 ## 1. 结论
 
-终端层要**分成两个独立目标**看，否则会严重高估工作量：
+终端层要**分成两个独立目标**看，否则会严重误判工作量：
 
-| 目标 | 内容 | 依赖 | 必要性 |
-|------|------|------|--------|
-| **A. 命令执行（PTY 执行）** | `run_terminal_cmd`、后台任务、子 Agent 执行命令 | `portable-pty` + `libc` | **必需**（核心工具） |
-| **B. 交互 TUI** | 全屏界面、输入、渲染 | `crossterm` + `ratatui` + **mio** | 可选（服务形态不需要） |
+| 目标 | 内容 | 需要 PTY？ | 依赖 | 后台 agent 形态 |
+|------|------|-----------|------|----------------|
+| **A. 命令执行** | `run_terminal_cmd`、后台任务、子 Agent 执行命令 | ❌ **不需要**（`Stdio::piped()`） | 仅 `tokio::process` | ✅ 必需（但零 PTY 成本） |
+| **B. 交互终端 / TUI** | 全屏界面、交互式 shell、终端模拟 | ✅ 需要 | `portable-pty` + `alacritty_terminal` + `crossterm`(**mio**) | ❌ 可跳过 |
 
-**关键判断**：如果目标形态是 headless / stdio / ACP 服务，**只需要打通 A**，B 可以后置甚至不做。而 A 的难点集中在 `portable-pty` 能否在 QNX 编译 + `devc-pty` 是否运行，**不涉及 mio**。
+**关键判断**（经代码核实）：
+
+```rust
+// xai-grok-shell-terminal/src/local_terminal.rs:104
+.stdout(Stdio::piped())        // ← pipe，不是 PTY
+.stderr(Stdio::piped())
+```
+
+命令执行backend 有两条（`xai-grok-shell/src/agent/mvp_agent/agent_ops.rs:4090`）：
+
+- `client_terminal == true` → `AcpTerminalRunner`（**客户端**执行，如 IDE）
+- `client_terminal == false` → 本地 streaming runner（**pipe**）
+
+**PTY 只存在于**：`xai-grok-shell-terminal/src/pty_session.rs`、`xai-grok-shell/src/extensions/terminal.rs:290`（`x.ai/terminal/pty/create`）、独立的 `ptyctl` 工具、测试用的 `xai-grok-pager-pty-harness`。
+
+→ **后台 agent 跑 `run_terminal_cmd` 完全不需要 PTY；只有 TUI/交互式终端才需要。**
 
 ---
 
@@ -67,9 +86,27 @@ QNX 侧要点：
 
 ---
 
-## 4. A 路：命令执行（必需）
+## 4. A 路：命令执行（**不需要 PTY**）
 
-### 4.1 `portable-pty 0.9` 的风险
+### 4.1 现状：pipe 已足够
+
+`run_terminal_cmd` 以及后台任务、子 Agent 的命令执行走两个 runner：
+
+| runner | 文件 | 机制 |
+|--------|------|------|
+| `LocalTerminalRunner` | `local_terminal.rs:104` | `Stdio::piped()` + `tokio::process` |
+| `StreamingLocalTerminalRunner` | `streaming_local_terminal.rs:857` | 同上（带流式输出与前台/后台切换） |
+
+**所以 A 路的移植成本 = 0（PTY 部分）**，真正的依赖只有 `tokio::process` —— 见 [`porting-qnx-process.md`](./porting-qnx-process.md)。
+
+### 4.2 唯一需处理的例外：`x.ai/terminal/pty/create`
+
+`xai-grok-shell/src/extensions/terminal.rs:290` 提供了一个供**客户端主动请求 PTY** 的扩展方法。对后台 agent：
+
+- 若客户端不会请求 PTY（绝大多数服务场景）→ 可用 `cfg`/feature 将 `pty_session.rs` 与该 handler 排除出构建
+- 这正好作为 `portable-pty` 在 QNX 编译失败时的兜底
+
+### 4.3 `portable-pty 0.9` 的真正用户（仅 TUI 场景）
 
 `portable-pty`（wezterm 项目）的 unix 实现在 `src/unix.rs`，依赖：
 
@@ -79,7 +116,7 @@ QNX 侧要点：
 
 **风险点**：`portable-pty` 的 `[target.'cfg(unix)']` 依赖与 `libc` 绑定是否覆盖 QNX **[待实测]**。QNX 是 `cfg(unix)`，所以会尝试编译 —— 若其内部用了 Linux/macOS 专有常量，编译失败。
 
-**三个应对**：
+**三个应对**（仅做 TUI 时才需要）：
 
 | 方案 | 说明 | 代价 |
 |------|------|------|
@@ -87,18 +124,20 @@ QNX 侧要点：
 | 2. 打补丁适配 QNX | 改 `portable-pty` 的 unix 分支（fork + `[patch.crates-io]`） | 1–2 周 |
 | 3. 自研 PTY 后端 | 用 `libc` 直接 `posix_openpt`/`openpty` + `ioctl` | 1–2 周 |
 
-> 仓库里 `ptyctl` 已经把 PTY 操作封装成自己的 `pty.rs`（`PtyConfig` + `spawn`），**方案 3 的沉没成本比看起来低** —— 只需要替换它内部对 `portable-pty` 的调用。
+> 仓库里 `ptyctl` 已经把 PTY 操作封装成自己的 `pty.rs`（`PtyConfig` + `spawn`），**方案 3 的沉没成本比看起来低**。
 
-### 4.2 与 process 层的交叉
+### 4.4 与 process 层的交叉（仅 TUI 场景）
 
 PTY 子进程的 spawn 走 `pre_exec`（`setsid` + `TIOCSCTTY` + PDEATHSIG），因此：
 
 - **受 [`porting-qnx-process.md`](./porting-qnx-process.md) §4 L2 影响**：`pre_exec` 强制 `fork` 路径，QNX 上应改为 `posix_spawn` 的 `POSIX_SPAWN_SETSID` 等属性
-- PDEATHSIG 需替换为 channel 断连守卫（同 §5）
+- PDEATHSIG 需替换为 channel 断连守卫
+
+> 后台 agent 形态下这一节不适用（不走 PTY）。
 
 ---
 
-## 5. B 路：交互 TUI（可选）
+## 5. B 路：交互终端与 TUI（可跳过）
 
 ### 5.1 crossterm 的隐藏依赖：mio
 
@@ -137,6 +176,8 @@ crossterm = { workspace = true, features = ["event-stream", "bracketed-paste"] }
 
 ## 7. 探针计划
 
+> 下列探针**仅在 TUI / 交互式终端目标下需要**。后台 agent 形态（§0 of index）可直接跳到 `porting-qnx-process.md` 的 P1–P6。
+
 ```rust
 // T1: PTY 创建（最小）
 let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 80, ..Default::default() })?;
@@ -158,11 +199,27 @@ pair.master.resize(PtySize { rows: 40, cols: 120, ..Default::default() })?;
 // 触发 panic → 验证 termios 被恢复
 ```
 
-**T1 是最关键的 30 分钟验证**：`devc-pty` + `openpty` 通不通，决定 A 路是"零成本"还是"1–2 周"。
+**T1 是最关键的 30 分钟验证**（仅 TUI 目标下）：`devc-pty` + `openpty` 通不通，决定是否需 1–2 周的自研/补丁工作。
+
+> 验证 **A 路（命令执行）不需要 PTY** 只需一个普通探针：
+> ```rust
+> let out = tokio::process::Command::new("ls").output().await?;   // pipe 路径
+> ```
+> 这就是 [`porting-qnx-process.md`](./porting-qnx-process.md) 的 P1。
 
 ---
 
 ## 8. 工作量估算
+
+### 8.1 后台 agent 形态（推荐）
+
+| 项 | 时间 |
+|----|------|
+| **A 路（命令执行）** | **0**（pipe，仅依赖 `tokio::process`） |
+| PTY（`pty_session` / `x.ai/terminal/pty/create`）feature 排除 | 1–2 天 |
+| **合计** | **1–2 天** |
+
+### 8.2 TUI / 交互终端形态
 
 | 项 | 时间 |
 |----|------|
@@ -171,8 +228,8 @@ pair.master.resize(PtySize { rows: 40, cols: 120, ..Default::default() })?;
 | 或自研 PTY 后端（若需要） | 1–2 周 |
 | PTY 会话（`ptyctl` / `pty_session`）适配 | 3–5 天 |
 | terminfo / TERM 环境 | 1–2 天 |
-| **A 路合计** | **1–3 周** |
-| B 路（TUI）：依赖 mio + crossterm 验证 | 受 mio 阻塞，另计 1–2 周 |
+| **PTY 合计** | **1–3 周** |
+| TUI（`crossterm` + mio + 渲染） | 受 mio 阻塞，另计 1–2 周 |
 
 ---
 

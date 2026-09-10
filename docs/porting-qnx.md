@@ -2,6 +2,8 @@
 
 > 目标平台：**QNX 8.0 / aarch64**（Rust target `aarch64-unknown-nto-qnx800`）
 > 分析基准：本仓库 `upstream/main` @ `37949780`（源 rev `eb4a894`）
+>
+> ⚠️ **目标形态先行**：若目标是**后台 agent 进程**（`grok agent stdio|serve|leader|headless`），可跳过 TUI / PTY / 剪贴板 / 音频，工作量从 4–6 个月降至 **2.5–4 个月**。详见 [`porting-qnx-index.md`](./porting-qnx-index.md) §0（含“命令执行不需 PTY”的代码依据）。
 > 说明：文中"实测数据"来自对 `crates/` 源码与 `Cargo.{toml,lock}` 的统计；标注 **[待实测]** 的条目必须在真实 QNX SDP 8.0 环境上验证后再决策。
 > 架构背景见 [`architecture.md`](./architecture.md)。
 > **移植专题文档**（建议从索引入）：[`porting-qnx-index.md`](./porting-qnx-index.md) —— mio 后端 [`porting-qnx-mio.md`](./porting-qnx-mio.md)、子进程 [`porting-qnx-process.md`](./porting-qnx-process.md)、PTY/终端 [`porting-qnx-pty.md`](./porting-qnx-pty.md)、文件事件 [`porting-qnx-fsevents.md`](./porting-qnx-fsevents.md)、TLS/加密 [`porting-qnx-tls.md`](./porting-qnx-tls.md)。
@@ -210,16 +212,19 @@ fn restrict_network_at_known_linux_launches(configured: bool) -> bool {
 
 ## 7. 分阶段路线图
 
+> ⚠️ 下表为**全形态**路线图。若目标是**后台 agent 进程**（推荐，见 [`porting-qnx-index.md`](./porting-qnx-index.md) §0），可跳过 PTY/TUI 项，总计降至 **2.5–4 个月**。
+
 | 阶段 | 内容 | 周期 | 验收标准 |
 |------|------|------|---------|
 | **0. 可行性探针** | QNX SDP 8.0 工具链 + `-Z build-std`；编译 `libc`/`tokio`（含 mio 后端 spike） | 1–2 周 | **最小 tokio echo server 在 QNX aarch64 跑通**（go/no-go 决策点） |
+| **0.5 构建面裁剪**（推荐） | `xai-grok-pager-bin` 的 TUI feature 化；PTY 代码 feature 排除 | 3–5 天 | 能构建**不含** crossterm/portable-pty/ratatui 的服务二进制 |
 | **1. 纯 Rust 叶子层** | `xai-grok-sampler`、`-sampling-types`、`xai-grok-compaction`、`xai-compaction-transcript`、`xai-prompt-queue`、`xai-workflow`（rhai）、`xai-token-estimation`、`xai-grok-secrets` | 2–3 周 | 建立 QNX target 下的**依赖裁剪清单** |
-| **2. 平台抽象层** | `xai-platform-qnx`：sandbox / fs-events / power / clipboard / audio / TLS roots | 3–4 周 | 所有 `#[cfg]` 平台分支收敛为 PAL 注入 |
-| **3. 服务形态跑通** | 优先 headless / stdio / ACP，**跳过 TUI** | 4–6 周 | `grok agent stdio` 完成一轮真实对话 + 工具调用（读文件、跑命令） |
+| **2. 平台抽象层** | `xai-platform-qnx`：sandbox / fs-events / TLS roots（后台 agent 形态无需 power / clipboard / audio / PTY） | 1–2 周 | 所有 `#[cfg]` 平台分支收敛为 PAL 注入 |
+| **3. 服务形态跑通** | `grok agent stdio` / `serve` / `leader` / `headless`，**跳过 TUI** | 3–4 周 | 完成一轮真实对话 + 工具调用（读文件、跑命令） |
 | **4. 工作区与沙箱语义** | worktree fallback、git 操作（`gix`）、权限模型叠加 | 3–5 周 | 文件编辑/回滚/检查点语义正确 |
-| **5. TUI（可选）** | 依赖阶段 2 的 PTY/终端能力（`devc-pty` + terminfo） | 4–8 周 | 全屏 TUI 可用 |
+| **5. PTY + TUI（仅交互场景）** | `portable-pty` 适配（`devc-pty` + terminfo）+ crossterm/ratatui | 4–8 周 | 全屏 TUI 可用 |
 
-**总计 4–6 个月**（1–2 名熟悉 Rust + QNX 的工程师）。其中 **mio 后端约占 1/4 工作量，且是唯一的全局风险点**。
+**总计**：后台 agent 形态 **2.5–4 个月**；含 TUI 全形态 **4–6 个月**（1–2 名熟悉 Rust + QNX 的工程师）。其中 **mio 后端是唯一的全局风险点**。
 
 ---
 

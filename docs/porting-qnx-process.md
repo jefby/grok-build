@@ -175,6 +175,8 @@ QNX 的 `fork()` 支持（POSIX 要求），但：
 
 ## 5. PDEATHSIG 的 QNX 替代（设计题）
 
+> ⚠️ **后台 agent 形态下本节的必要性大幅降低**：两处 `PDEATHSIG` 调用点都在 **TUI 相关路径**（`mermaid_worker` 渲染、`pty_spawn` PTY 会话）。若只做 `grok agent stdio|serve|leader|headless`，可先不替换，把它归入 TUI 工作包（见 [`porting-qnx-index.md`](./porting-qnx-index.md) §0）。
+
 `PR_SET_PDEATHSIG(SIGKILL)` 解决的是：**父进程被 SIGKILL（无 Drop 机会）时，子进程不能泄漏**。
 
 QNX 无等价物，三个方案：

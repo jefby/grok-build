@@ -159,6 +159,15 @@ pub struct PrincipalKey {
     fingerprint: String,
 }
 
+impl PrincipalKey {
+    /// Stable non-secret fingerprint (e.g. OIDC issuer+client); never tokens.
+    pub fn opaque(fingerprint: impl Into<String>) -> Self {
+        Self {
+            fingerprint: fingerprint.into(),
+        }
+    }
+}
+
 impl fmt::Debug for PrincipalKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PrincipalKey").finish_non_exhaustive()
@@ -184,6 +193,10 @@ pub struct AuthIdentity {
 
 /// Credential provider called on every connect/reconnect.
 pub trait AuthProvider: Send + Sync + std::fmt::Debug {
+    /// The credential to present now. Must return promptly, or at least in
+    /// bounded time: the SDK also calls it from the blocking pool once per
+    /// connected phase and then periodically, and cannot cancel a call in
+    /// flight.
     fn current(&self) -> AuthCredential;
 
     /// Stable pool-dedup key, decoupled from the per-connect credential.

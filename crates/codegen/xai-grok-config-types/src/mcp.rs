@@ -1,5 +1,4 @@
-//! MCP server configuration value types, extracted from xai-grok-shell
-//! (config dependency inversion).
+//! MCP server configuration value types, extracted from xai-grok-shell so crates the shell depends on can use them.
 
 use agent_client_protocol as acp;
 use indexmap::IndexMap;
@@ -8,14 +7,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use xai_grok_mcp::oauth_config::McpOAuthConfig;
 
-/// serde default helper. Kept module-local rather than shared — the `pool`
-/// module keeps its own copy for `PoolConfig`.
+/// serde default helper.
 fn default_true() -> bool {
     true
 }
 
-/// Read an MCP OAuth client secret from the named env var. Moved here with
-/// `McpServerConfig` (its only caller).
+/// Read an MCP OAuth client secret from the named env var. `McpServerConfig` is its only caller.
 fn resolve_oauth_client_secret(env_var: Option<&String>) -> Option<String> {
     let env_var = env_var?;
     match std::env::var(env_var) {
@@ -45,7 +42,8 @@ pub enum McpServerTransportConfig {
         cwd: Option<String>,
     },
     StreamableHttp {
-        #[serde(default, alias = "urlTemplate", alias = "url_template")]
+        // Not `default`: a missing url must fail to deserialize, not become a fake HTTP server with an empty url
+        #[serde(alias = "urlTemplate", alias = "url_template")]
         url: String,
         #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
         transport_type: Option<String>,
@@ -66,7 +64,52 @@ pub enum McpServerTransportConfig {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpServerProblemSeverity {
+    Error,
+    Warning,
+}
+
+/// A problem found loading an `[mcp_servers.*]` entry. It is reported (never fatal) and shown by `grok inspect`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerConfigProblem {
+    pub server: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    pub severity: McpServerProblemSeverity,
+    pub message: String,
+}
+
+/// Recognized wire keys for an `[mcp_servers.*]` entry.
+/// It exists because the flattened untagged transport enum bypasses `serde_ignored`.
+/// `known_mcp_server_fields_cover_serialized_keys` keeps it in sync.
+pub const KNOWN_MCP_SERVER_FIELDS: &[&str] = &[
+    "args",
+    "bearer_token_env_var",
+    "command",
+    "cwd",
+    "enabled",
+    "env",
+    "expose_image_base64",
+    "headers",
+    "oauth",
+    "oauth_client_id",
+    "oauth_client_secret_env_var",
+    "oauth_scopes",
+    "setup",
+    "startup_timeout_sec",
+    "tool_timeout_sec",
+    "tool_timeouts",
+    "type",
+    "url",
+    // Deserialize-only aliases for `url`.
+    "urlTemplate",
+    "url_template",
+];
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct McpJsonOAuthBlock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,14 +221,29 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_timeout_sec: Option<u64>,
     /// Per-tool timeout overrides in seconds: `{ "create_issue" = 120, "search" = 30 }`.
-    /// Falls back to `tool_timeout_sec` for tools not listed here.
+    /// Tools not listed here fall back to `tool_timeout_sec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_timeouts: Option<HashMap<String, u64>>,
-    /// Also keep the raw base64 in tool-result text so agents can forward
-    /// bytes via path-based tools (`base64 -d > /tmp/x.png && send_file ...`).
-    /// ~2× tokens per image. Overridden by `_meta.mcpConfig.<server>.exposeImageBase64`.
+    /// Also keep the raw base64 in tool-result text so agents can forward bytes via path-based tools (`base64 -d > /tmp/x.png && send_file ...`).
+    /// It roughly doubles the tokens per image. `_meta.mcpConfig.<server>.exposeImageBase64` overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expose_image_base64: Option<bool>,
+}
+
+impl McpServerConfig {
+    /// The transport field (`command` or `url`) that is present but blank, if
+    /// any. Such a server can never connect, so the loader drops it.
+    pub fn blank_transport_field(&self) -> Option<&'static str> {
+        match &self.transport {
+            McpServerTransportConfig::Stdio { command, .. } if command.trim().is_empty() => {
+                Some("command")
+            }
+            McpServerTransportConfig::StreamableHttp { url, .. } if url.trim().is_empty() => {
+                Some("url")
+            }
+            _ => None,
+        }
+    }
 }
 
 fn render_setup_template(
@@ -197,16 +255,27 @@ fn render_setup_template(
     while let Some(start) = rest.find("{{") {
         let (prefix, after_start) = rest.split_at(start);
         out.push_str(prefix);
-        let after_start = &after_start[2..];
+        let Some(after_start) = after_start.strip_prefix("{{") else {
+            return Err("unterminated setup variable template".to_string());
+        };
         let Some(end) = after_start.find("}}") else {
             return Err("unterminated setup variable template".to_string());
         };
-        let key = after_start[..end].trim();
+        let Some(key) = after_start.get(..end) else {
+            return Err("unterminated setup variable template".to_string());
+        };
+        let key = key.trim();
         let Some(value) = variables.get(key) else {
             return Err(format!("unresolved setup variable '{key}'"));
         };
         out.push_str(value);
-        rest = &after_start[end + 2..];
+        let Some(remaining) = after_start.get(end..) else {
+            return Err("unterminated setup variable template".to_string());
+        };
+        let Some(remaining) = remaining.strip_prefix("}}") else {
+            return Err("unterminated setup variable template".to_string());
+        };
+        rest = remaining;
     }
     out.push_str(rest);
     Ok(out)
@@ -252,19 +321,17 @@ fn render_setup_templates(
 impl McpServerConfig {
     /// Resolve `setup` templates using stored preferences.
     ///
-    /// v0 supports exactly one select field with options. Multi-field schemas
-    /// are Invalid until the TUI can collect them.
+    /// v0 supports exactly one select field with options. Multi-field schemas are Invalid until the TUI can collect them.
     pub fn resolve_setup(&self, preferences: Option<&McpServerPreferences>) -> McpSetupResolution {
         let Some(setup) = self.setup.as_ref() else {
             return McpSetupResolution::Resolved(Box::new(self.clone()));
         };
 
-        if setup.fields.len() != 1 {
+        let [field] = setup.fields.as_slice() else {
             return McpSetupResolution::Invalid(
                 "setup schema must declare exactly one select field (v0)".to_string(),
             );
-        }
-        let field = &setup.fields[0];
+        };
         if !matches!(field.field_type, McpSetupFieldType::Select) || field.options.is_empty() {
             return McpSetupResolution::Invalid(
                 "setup field must be a non-empty select (v0)".to_string(),
@@ -382,13 +449,12 @@ impl McpServerConfig {
                     })
                     .unwrap_or_default();
 
-                // Add bearer token from environment variable if specified
                 if let Some(env_var) = bearer_token_env_var {
                     match std::env::var(env_var) {
                         Ok(token) => {
                             http_headers.push(acp::HttpHeader::new(
                                 "Authorization",
-                                format!("Bearer {}", token),
+                                format!("Bearer {token}"),
                             ));
                         }
                         Err(_) => {
@@ -452,21 +518,14 @@ impl McpServerConfig {
     }
 }
 
-/// Configuration for relay session sharing.
-/// Set in config.toml under [relay] section.
-///
-/// Example:
-/// ```toml
-/// [relay]
-/// enabled = true
-/// ```
+/// Configuration for relay session sharing, set in config.toml under the `[relay]` section.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RelaySyncConfig {
     pub enabled: Option<bool>,
 }
 
 impl RelaySyncConfig {
-    /// Check if relay sync is enabled. Env var takes precedence over config.
+    /// Check if relay sync is enabled. `GROK_RELAY_SYNC_ENABLED` takes precedence over config.
     pub fn is_enabled(&self) -> bool {
         if let Ok(env_val) = std::env::var("GROK_RELAY_SYNC_ENABLED") {
             return env_val.eq_ignore_ascii_case("true") || env_val == "1";
@@ -519,12 +578,115 @@ mod tests {
     }
 
     #[test]
+    fn transport_less_entry_fails_to_deserialize() {
+        for value in [
+            serde_json::json!({ "enabled": false }),
+            serde_json::json!({ "enabled": true }),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                serde_json::from_value::<McpServerConfig>(value.clone()).is_err(),
+                "transport-less entry must not deserialize: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_transport_field_is_detected_symmetrically() {
+        let blank_url: McpServerConfig =
+            serde_json::from_value(serde_json::json!({ "url": "  " })).unwrap();
+        assert_eq!(blank_url.blank_transport_field(), Some("url"));
+
+        let blank_command: McpServerConfig =
+            serde_json::from_value(serde_json::json!({ "command": "\t" })).unwrap();
+        assert_eq!(blank_command.blank_transport_field(), Some("command"));
+
+        let ok: McpServerConfig =
+            serde_json::from_value(serde_json::json!({ "command": "npx" })).unwrap();
+        assert_eq!(ok.blank_transport_field(), None);
+    }
+
+    /// A newly added field cannot silently escape `KNOWN_MCP_SERVER_FIELDS`.
+    #[test]
+    fn known_mcp_server_fields_cover_serialized_keys() {
+        let stdio = McpServerConfig {
+            transport: McpServerTransportConfig::Stdio {
+                command: "npx".into(),
+                args: vec!["-y".into()],
+                env: Some(HashMap::from([("A".into(), "b".into())])),
+                cwd: Some("/tmp".into()),
+            },
+            enabled: true,
+            oauth: Some(McpJsonOAuthBlock::default()),
+            setup: None,
+            startup_timeout_sec: Some(10),
+            tool_timeout_sec: Some(20),
+            tool_timeouts: Some(HashMap::from([("t".into(), 1)])),
+            expose_image_base64: Some(true),
+        };
+        let http = McpServerConfig {
+            transport: McpServerTransportConfig::StreamableHttp {
+                url: "https://x/mcp".into(),
+                transport_type: Some("http".into()),
+                bearer_token_env_var: Some("TOK".into()),
+                headers: Some(HashMap::from([("H".into(), "v".into())])),
+                oauth_client_id: Some("id".into()),
+                oauth_client_secret_env_var: Some("SEC".into()),
+                oauth_scopes: Some(vec!["s".into()]),
+            },
+            enabled: true,
+            oauth: None,
+            setup: None,
+            startup_timeout_sec: None,
+            tool_timeout_sec: None,
+            tool_timeouts: None,
+            expose_image_base64: None,
+        };
+        for config in [stdio, http] {
+            let value = serde_json::to_value(&config).unwrap();
+            for key in value.as_object().unwrap().keys() {
+                assert!(
+                    KNOWN_MCP_SERVER_FIELDS.contains(&key.as_str()),
+                    "field `{key}` is serialized but missing from KNOWN_MCP_SERVER_FIELDS"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stdio_and_http_still_parse() {
+        let stdio: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "npx",
+            "args": ["-y", "pkg"]
+        }))
+        .unwrap();
+        assert!(stdio.enabled);
+        assert!(matches!(
+            stdio.transport,
+            McpServerTransportConfig::Stdio { .. }
+        ));
+
+        let http: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "url": "https://mcp.example.com/mcp"
+        }))
+        .unwrap();
+        assert!(matches!(
+            http.transport,
+            McpServerTransportConfig::StreamableHttp { .. }
+        ));
+        assert!(http.to_acp_mcp_server("x").is_some());
+    }
+
+    #[test]
     fn mcp_setup_schema_parses_and_missing_preference_requires_setup() {
         let config: McpConfig = serde_json::from_str(site_select_setup_json()).unwrap();
         let server = config.mcp_servers.get("acme").unwrap();
         let setup = server.setup.as_ref().unwrap();
-        assert_eq!(setup.fields[0].id, "site");
-        assert_eq!(setup.fields[0].default.as_deref(), Some("us1"));
+        let [field] = setup.fields.as_slice() else {
+            panic!("expected exactly one setup field: {:?}", setup.fields);
+        };
+        assert_eq!(field.id, "site");
+        assert_eq!(field.default.as_deref(), Some("us1"));
         assert!(setup.variables.contains_key("url"));
         assert!(matches!(
             server.resolve_setup(None),

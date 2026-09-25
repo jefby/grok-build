@@ -6,6 +6,8 @@ impl SessionActor {
         self: &Arc<Self>,
         action: BuiltinAction,
     ) -> PromptTurnResult {
+        // Builtin turns carry no user message, so a send-now may cancel from the start.
+        self.mark_front_message_committed().await;
         xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SlashCommandUsed {
             command: action.command_name().to_string(),
             args_provided: action.args_provided(),
@@ -18,28 +20,33 @@ impl SessionActor {
             BuiltinAction::SetYolo { enabled } => {
                 let was = self.permissions.is_yolo_mode();
                 self.permissions.set_yolo_mode(enabled);
-                // Report the ACTUAL state, not the request: the manager clamps a
-                // requested ON to OFF under the always-approve pin, so `enabled`
-                // would mis-report a turn-on (event, telemetry, and the log line)
-                // that never happened.
+                // Report the ACTUAL state: the manager clamps a requested ON to OFF under the always-approve pin
+                // Echoing `enabled` would report a turn-on (event, telemetry, and the log line) that never happened
                 let actual = self.permissions.is_yolo_mode();
                 if let Some(actual) = yolo_toggle_report(was, actual) {
                     self.emit_event(crate::session::events::Event::YoloToggled { enabled: actual });
+                    let from_mode = if self.plan_mode.lock().is_active() {
+                        "plan"
+                    } else if was {
+                        "bypass_permissions"
+                    } else {
+                        "default"
+                    };
                     xai_grok_telemetry::session_ctx::log_event(
                         xai_grok_telemetry::events::YoloToggled {
                             enabled: actual,
                             previous_state: was,
                             trigger: xai_grok_telemetry::events::YoloTrigger::SlashCommand,
+                            from_mode: Some(from_mode.to_owned()),
                         },
                     );
-                    tracing::info_span!(
+                    xai_grok_telemetry::event_span!(
                         "session.permission_mode_changed",
                         from_mode = crate::session::telemetry::permission_mode_label(was),
                         to_mode = crate::session::telemetry::permission_mode_label(actual),
                         trigger = "slash_command",
                         enabled = actual,
-                    )
-                    .in_scope(|| {});
+                    );
                 }
                 let status = if actual { "enabled" } else { "disabled" };
                 tracing::info!(
@@ -50,33 +57,18 @@ impl SessionActor {
                 );
                 ok_end_turn(0, None)
             }
+            // Prompt-turn path for clients without the pager-local `/flush` and `/dream`;
+            // the pager calls `x.ai/memory/flush` and `x.ai/memory/dream` instead.
             BuiltinAction::FlushMemory => {
-                if self.memory.is_enabled() {
-                    let did_flush = self.run_memory_flush("slash_command", None).await;
-                    if !did_flush {
-                        tracing::info!(
-                            session_id = %self.session_info.id.0,
-                            "memory flush skipped via /flush: another flush already in progress",
-                        );
-                    }
-                } else {
-                    tracing::warn!(
-                        session_id = %self.session_info.id.0,
-                        "memory flush skipped via /flush: memory not enabled for this session",
-                    );
-                }
+                let response = self.memory_flush_command().await;
+                self.send_host_turn_slash_command_output(&response.summary())
+                    .await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::Dream => {
-                // No user-visible output — intentional, matches /flush behaviour.
-                if self.memory.is_enabled() {
-                    self.run_dream_slash_command().await;
-                } else {
-                    tracing::warn!(
-                        session_id = %self.session_info.id.0,
-                        "dream skipped via /dream: memory not enabled for this session",
-                    );
-                }
+                let response = self.memory_dream_command().await;
+                self.send_host_turn_slash_command_output(&response.summary())
+                    .await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::ContextInfo => ok_end_turn(0, None),
@@ -95,7 +87,7 @@ impl SessionActor {
                         e
                     }
                 };
-                self.send_slash_command_output(&msg).await;
+                self.send_host_turn_slash_command_output(&msg).await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::HooksList => {
@@ -132,12 +124,12 @@ impl SessionActor {
                     }
                     None => "No hooks loaded for this session.".to_string(),
                 };
-                self.send_slash_command_output(&text).await;
+                self.send_host_turn_slash_command_output(&text).await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::HooksAdd { path } => {
                 if path.is_empty() {
-                    self.send_slash_command_output(
+                    self.send_host_turn_slash_command_output(
                         "Usage: /hooks add <path>\nProvide a path to a hook JSON file or directory under ~/.grok/.",
                     )
                     .await;
@@ -149,7 +141,7 @@ impl SessionActor {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::HookAdded { success: true },
                             );
-                            self.send_slash_command_output(&format!(
+                            self.send_host_turn_slash_command_output(&format!(
                                 "Added hook path: {path}\n\
                                  Restart session to load hooks from this path."
                             ))
@@ -159,7 +151,7 @@ impl SessionActor {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::HookAdded { success: false },
                             );
-                            self.send_slash_command_output(&format!(
+                            self.send_host_turn_slash_command_output(&format!(
                                 "Failed to add hook path: {e}"
                             ))
                             .await;
@@ -170,18 +162,28 @@ impl SessionActor {
             }
             BuiltinAction::HooksRemove { path } => {
                 if path.is_empty() {
-                    self.send_slash_command_output(
+                    self.send_host_turn_slash_command_output(
                         "Usage: /hooks-remove <path>\nProvide the path to remove from hooks-paths.",
                     )
                     .await;
                 } else {
                     match crate::config::remove_hooks_path(&path) {
-                        Ok(()) => {
+                        Ok(true) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::HookRemoved { success: true },
                             );
-                            self.send_slash_command_output(&format!(
+                            self.send_host_turn_slash_command_output(&format!(
                                 "Removed hook path: {path}\nRestart session to stop loading hooks from this path."
+                            ))
+                            .await;
+                        }
+                        Ok(false) => {
+                            xai_grok_telemetry::session_ctx::log_event(
+                                xai_grok_telemetry::events::HookRemoved { success: false },
+                            );
+                            self.send_host_turn_slash_command_output(&format!(
+                                "{path} is not a user-registered hook directory; \
+                                 config-defined hook sources cannot be removed from here."
                             ))
                             .await;
                         }
@@ -189,7 +191,7 @@ impl SessionActor {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::HookRemoved { success: false },
                             );
-                            self.send_slash_command_output(&format!(
+                            self.send_host_turn_slash_command_output(&format!(
                                 "Failed to remove hook path: {e}"
                             ))
                             .await;
@@ -204,7 +206,7 @@ impl SessionActor {
                     Ok((root, false)) => format!("Not currently trusted: {}", root.display()),
                     Err(e) => e,
                 };
-                self.send_slash_command_output(&msg).await;
+                self.send_host_turn_slash_command_output(&msg).await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::PluginsList => {
@@ -271,24 +273,24 @@ impl SessionActor {
                     }
                     _ => "No plugins installed.".to_string(),
                 };
-                self.send_slash_command_output(&text).await;
+                self.send_host_turn_slash_command_output(&text).await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::PluginsReload => {
                 match &self.plugin_registry_handle {
                     Some(handle) => {
-                        // Explicit user reload: force a full local-install re-copy.
+                        // An explicit user reload forces a full re-copy of locally installed plugins
                         let msg = self.reload_plugins_impl(handle, true).await;
                         xai_grok_telemetry::session_ctx::log_event(
                             xai_grok_telemetry::events::PluginReloaded { success: true },
                         );
-                        self.send_slash_command_output(&msg).await;
+                        self.send_host_turn_slash_command_output(&msg).await;
                     }
                     None => {
                         xai_grok_telemetry::session_ctx::log_event(
                             xai_grok_telemetry::events::PluginReloaded { success: false },
                         );
-                        self.send_slash_command_output(
+                        self.send_host_turn_slash_command_output(
                             "No plugin registry handle available. Start a new session to discover plugins.",
                         )
                         .await;
@@ -297,7 +299,7 @@ impl SessionActor {
                 ok_end_turn(0, None)
             }
             BuiltinAction::PluginsTrust => {
-                self.send_slash_command_output(
+                self.send_host_turn_slash_command_output(
                     "Trust/untrust has been replaced by enable/disable. Use /plugins enable <id> instead.",
                 )
                 .await;
@@ -316,10 +318,7 @@ impl SessionActor {
                 } else {
                     format!("**Model:** {}", model)
                 };
-                let model_hash_line = if crate::session::acp_types::should_show_model_fingerprint(
-                    info.show_model_fingerprint,
-                    &model,
-                ) {
+                let model_hash_line = if info.show_model_fingerprint {
                     info.model_fingerprint
                         .as_deref()
                         .map(|fp| format!("\n\n**Model Hash:** {fp}"))
@@ -367,12 +366,12 @@ impl SessionActor {
                     ctx.total,
                     context_pct,
                 );
-                self.send_slash_command_output(&text).await;
+                self.send_host_turn_slash_command_output(&text).await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::PluginsAdd { path } => {
                 if path.is_empty() {
-                    self.send_slash_command_output(
+                    self.send_host_turn_slash_command_output(
                         "Usage: /plugins add <path>\n\
                          Provide the path to a plugin directory to add.",
                     )
@@ -387,7 +386,7 @@ impl SessionActor {
                         }
                     };
                     let path_str = resolved.to_string_lossy().to_string();
-                    match crate::config::add_plugin_path(&path_str) {
+                    match crate::config::run_add_plugin_path(path_str.clone()).await {
                         Ok(()) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::PluginAdded {
@@ -396,10 +395,10 @@ impl SessionActor {
                                 },
                             );
                             let msg = format!("Added plugin path: {path_str}");
-                            self.send_slash_command_output(&msg).await;
+                            self.send_host_turn_slash_command_output(&msg).await;
                             if let Some(ref handle) = self.plugin_registry_handle {
                                 let reload_msg = self.reload_plugins_impl(handle, false).await;
-                                self.send_slash_command_output(&reload_msg).await;
+                                self.send_host_turn_slash_command_output(&reload_msg).await;
                             }
                         }
                         Err(e) => {
@@ -409,7 +408,7 @@ impl SessionActor {
                                     success: false,
                                 },
                             );
-                            self.send_slash_command_output(&format!(
+                            self.send_host_turn_slash_command_output(&format!(
                                 "Failed to add plugin path: {e}"
                             ))
                             .await;
@@ -420,7 +419,7 @@ impl SessionActor {
             }
             BuiltinAction::PluginsRemove { path } => {
                 if path.is_empty() {
-                    self.send_slash_command_output(
+                    self.send_host_turn_slash_command_output(
                         "Usage: /plugins remove <path>\n\
                          Provide the path to a plugin directory to remove.",
                     )
@@ -435,23 +434,23 @@ impl SessionActor {
                         }
                     };
                     let path_str = resolved.to_string_lossy().to_string();
-                    match crate::config::remove_plugin_path(&path_str) {
+                    match crate::config::run_remove_plugin_path(path_str.clone()).await {
                         Ok(()) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::PluginRemoved { success: true },
                             );
                             let msg = format!("Removed plugin path: {path_str}");
-                            self.send_slash_command_output(&msg).await;
+                            self.send_host_turn_slash_command_output(&msg).await;
                             if let Some(ref handle) = self.plugin_registry_handle {
                                 let reload_msg = self.reload_plugins_impl(handle, false).await;
-                                self.send_slash_command_output(&reload_msg).await;
+                                self.send_host_turn_slash_command_output(&reload_msg).await;
                             }
                         }
                         Err(e) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::PluginRemoved { success: false },
                             );
-                            self.send_slash_command_output(&format!(
+                            self.send_host_turn_slash_command_output(&format!(
                                 "Failed to remove plugin path: {e}"
                             ))
                             .await;
@@ -462,7 +461,7 @@ impl SessionActor {
             }
             BuiltinAction::PluginsInstall { source, trust } => {
                 if source.is_empty() {
-                    self.send_slash_command_output(
+                    self.send_host_turn_slash_command_output(
                         "Usage: /plugins install <source>\n\
                          Source can be a git URL or local path.\n\
                          Examples:\n\
@@ -493,7 +492,7 @@ impl SessionActor {
                                 format!("local directory: {}", path.display())
                             }
                         };
-                        self.send_slash_command_output(&format!(
+                        self.send_host_turn_slash_command_output(&format!(
                             "About to install plugin from: {source_desc}\n\
                              \n\
                              This will clone/link the source and activate all executable surfaces:\n\
@@ -506,7 +505,24 @@ impl SessionActor {
                         ))
                         .await;
                     } else {
-                        match crate::plugin::install_plugin(&source, cwd) {
+                        // Registry flock (bounded 30s poll) + clone — never on the LocalSet (invariant: plugin/acquire.rs).
+                        let installed = match tokio::task::spawn_blocking({
+                            let source = source.clone();
+                            let cwd = cwd.to_path_buf();
+                            move || crate::plugin::install_plugin(&source, &cwd)
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(e) => {
+                                self.send_host_turn_slash_command_output(&format!(
+                                    "Install task failed: {e}"
+                                ))
+                                .await;
+                                return ok_end_turn(0, None);
+                            }
+                        };
+                        match installed {
                             Ok(outcome) => {
                                 for w in &outcome.warnings {
                                     tracing::warn!("{w}");
@@ -524,15 +540,14 @@ impl SessionActor {
                                         error_category: None,
                                     },
                                 );
-                                tracing::info_span!(
+                                xai_grok_telemetry::event_span!(
                                     "plugin.installed",
                                     success = true,
-                                    install_kind = kind.as_str(),
+                                    install_kind = kind.as_ref(),
                                     plugin_count = outcome.plugin_names.len() as i64,
                                     plugin_name = %outcome.plugin_names.join(","),
-                                )
-                                .in_scope(|| {});
-                                self.send_slash_command_output(&format!(
+                                );
+                                self.send_host_turn_slash_command_output(&format!(
                                     "Installed {} plugin(s) from {source}: {}\n\
                                      Run /plugins reload to activate.",
                                     outcome.plugin_names.len(),
@@ -541,19 +556,18 @@ impl SessionActor {
                                 .await;
                             }
                             Err(e) => {
-                                let error_category = Self::classify_install_error(&e);
+                                let error_category = e.category();
                                 let kind = if crate::plugin::install_source_is_local(&source, cwd) {
                                     xai_grok_telemetry::events::InstallKind::Local
                                 } else {
                                     xai_grok_telemetry::events::InstallKind::Git
                                 };
-                                tracing::info_span!(
+                                xai_grok_telemetry::event_span!(
                                     "plugin.installed",
                                     success = false,
-                                    install_kind = kind.as_str(),
+                                    install_kind = kind.as_ref(),
                                     error_category = %error_category,
-                                )
-                                .in_scope(|| {});
+                                );
                                 xai_grok_telemetry::session_ctx::log_event(
                                     xai_grok_telemetry::events::PluginInstalled {
                                         install_kind: kind,
@@ -562,7 +576,7 @@ impl SessionActor {
                                         error_category: Some(error_category),
                                     },
                                 );
-                                self.send_slash_command_output(&format!(
+                                self.send_host_turn_slash_command_output(&format!(
                                     "Failed to install plugin: {e}"
                                 ))
                                 .await;
@@ -574,14 +588,31 @@ impl SessionActor {
             }
             BuiltinAction::PluginsUninstall { name, confirm } => {
                 if name.is_empty() {
-                    self.send_slash_command_output(
+                    self.send_host_turn_slash_command_output(
                         "Usage: /plugins uninstall <name>\n\
                          Provide the name of an installed plugin to remove.",
                     )
                     .await;
                 } else {
                     use crate::plugin::UninstallError;
-                    match crate::plugin::uninstall_plugin(&name, confirm, false) {
+                    // Takes the registry flock + removes directories — never
+                    // on the LocalSet (invariant: plugin/acquire.rs).
+                    let uninstalled = match tokio::task::spawn_blocking({
+                        let name = name.clone();
+                        move || crate::plugin::uninstall_plugin(&name, confirm, false)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            self.send_host_turn_slash_command_output(&format!(
+                                "Uninstall task failed: {e}"
+                            ))
+                            .await;
+                            return ok_end_turn(0, None);
+                        }
+                    };
+                    match uninstalled {
                         Ok(outcome) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::PluginUninstalled {
@@ -589,7 +620,7 @@ impl SessionActor {
                                     success: true,
                                 },
                             );
-                            self.send_slash_command_output(&format!(
+                            self.send_host_turn_slash_command_output(&format!(
                                 "Uninstalled repo \"{}\" ({} plugin(s): {})",
                                 outcome.repo_key,
                                 outcome.removed_plugins.len(),
@@ -603,7 +634,7 @@ impl SessionActor {
                             other_plugins,
                             total,
                         }) => {
-                            self.send_slash_command_output(&format!(
+                            self.send_host_turn_slash_command_output(&format!(
                                 "Plugin \"{name}\" belongs to repo \"{repo_key}\" which also contains:\n\
                                  {}\n\
                                  \n\
@@ -618,11 +649,21 @@ impl SessionActor {
                             .await;
                         }
                         Err(UninstallError::NotFound { name }) => {
-                            self.send_slash_command_output(&format!(
+                            self.send_host_turn_slash_command_output(&format!(
                                 "Plugin \"{name}\" not found in install registry.\n\
                                  Use /plugins list to see installed plugins."
                             ))
                             .await;
+                        }
+                        Err(UninstallError::RegistryLock { detail }) => {
+                            self.send_host_turn_slash_command_output(&format!(
+                                "Another plugin operation is in progress: {detail}"
+                            ))
+                            .await;
+                        }
+                        Err(e @ UninstallError::RegistrySave { .. }) => {
+                            self.send_host_turn_slash_command_output(&e.to_string())
+                                .await;
                         }
                     }
                 }
@@ -631,14 +672,30 @@ impl SessionActor {
             BuiltinAction::PluginsUpdate { name } => {
                 use crate::plugin::RepoUpdateOutcome;
 
-                match crate::plugin::update_plugins(name.as_deref()) {
+                // Sync git fetches never run on the session actor's LocalSet
+                // (invariant: plugin/acquire.rs).
+                let update_result = match tokio::task::spawn_blocking(move || {
+                    crate::plugin::update_plugins(name.as_deref())
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        self.send_host_turn_slash_command_output(&format!(
+                            "Plugin update task failed: {e}"
+                        ))
+                        .await;
+                        return ok_end_turn(0, None);
+                    }
+                };
+                match update_result {
                     Ok(outcomes) if outcomes.is_empty() => {
-                        self.send_slash_command_output("No installed plugins to update.")
+                        self.send_host_turn_slash_command_output("No installed plugins to update.")
                             .await;
                     }
                     Ok(outcomes) => {
                         fn short(c: Option<&str>) -> &str {
-                            c.map(|s| &s[..7.min(s.len())]).unwrap_or("?")
+                            c.and_then(|s| s.get(..7.min(s.len()))).unwrap_or("?")
                         }
                         let messages: Vec<String> = outcomes
                             .iter()
@@ -664,171 +721,137 @@ impl SessionActor {
                                 }
                             })
                             .collect();
-                        self.send_slash_command_output(&messages.join("\n")).await;
+                        self.send_host_turn_slash_command_output(&messages.join("\n"))
+                            .await;
                     }
                     Err(e) => {
-                        self.send_slash_command_output(&format!("{e}")).await;
+                        self.send_host_turn_slash_command_output(&format!("{e}"))
+                            .await;
                     }
                 }
                 ok_end_turn(0, None)
             }
             BuiltinAction::Feedback { text } => self.execute_feedback_command(text).await,
             BuiltinAction::MemoryBrowse => {
-                let file_infos = if let Some(ref storage) = *self.memory.storage.borrow() {
-                    match storage.list_memory_files() {
-                        Ok(files) => files
-                            .into_iter()
-                            .map(|path| {
-                                let meta = match std::fs::metadata(&path) {
-                                    Ok(m) => Some(m),
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            path = %path.display(),
-                                            error = %e,
-                                            "skipping memory file with unreadable metadata",
-                                        );
-                                        None
-                                    }
-                                };
-                                crate::extensions::notification::MemoryFileInfo {
-                                    source: storage.classify_source(&path).to_string(),
-                                    path: path.display().to_string(),
-                                    size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                                    modified_epoch_secs: meta
-                                        .and_then(|m| m.modified().ok())
-                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                        .map(|d| d.as_secs()),
-                                }
-                            })
-                            .collect(),
-                        Err(e) => {
-                            tracing::warn!(
-                                session_id = %self.session_info.id.0,
-                                error = %e,
-                                "failed to list memory files",
-                            );
-                            self.send_slash_command_output(&format!(
-                                "Failed to list memory files: {e}"
-                            ))
-                            .await;
-                            vec![]
-                        }
-                    }
-                } else {
-                    self.send_slash_command_output("Memory is not enabled for this session.")
+                match self.memory_listing() {
+                    Ok(listing) => {
+                        self.send_xai_notification(XaiSessionUpdate::MemoryFiles {
+                            files: listing.files,
+                            enabled: listing.enabled,
+                            disabled_reason: listing.disabled_reason,
+                            capture_enabled: listing.capture_enabled,
+                            dream_enabled: listing.dream_enabled,
+                        })
                         .await;
-                    vec![]
-                };
-                tracing::info!(
-                    session_id = %self.session_info.id.0,
-                    file_count = file_infos.len(),
-                    "memory browse: listing files",
-                );
-                self.send_xai_notification(XaiSessionUpdate::MemoryFiles { files: file_infos })
-                    .await;
+                    }
+                    // No modal: an empty list would render as a fresh store.
+                    Err(e) => self.send_host_turn_slash_command_output(&e).await,
+                }
                 ok_end_turn(0, None)
             }
-            BuiltinAction::MemoryToggle { enabled } => {
-                tracing::info!(
-                    session_id = %self.session_info.id.0,
-                    enabled,
-                    "memory toggle via /memory slash command",
-                );
-                let msg = if enabled && !self.memory.is_enabled() {
-                    if let Some(ref params) = self.memory.backend_params {
-                        let storage = crate::session::memory::MemoryStorage::new(
-                            std::path::Path::new(&self.session_info.cwd),
-                            None,
-                        );
-                        if let Err(e) = storage.ensure_initialized() {
-                            tracing::warn!(error = %e, "failed to initialize memory storage on re-enable");
-                            format!("Memory could not be enabled: {e}")
-                        } else {
-                            let backend =
-                                crate::session::memory::MemoryBackendImpl::from_session_params(
-                                    storage.clone(),
-                                    params,
-                                );
-                            *self.memory.search_counter.borrow_mut() =
-                                Some(backend.search_counter.clone());
-                            let backend: std::sync::Arc<
-                                dyn xai_grok_tools::types::memory_backend::MemoryBackend,
-                            > = std::sync::Arc::new(backend);
-                            let bridge = self.agent.borrow().tool_bridge().clone();
-                            bridge.update_resource(backend.clone()).await;
-                            if let Err(e) = self.register_memory_tools(&bridge).await {
-                                tracing::warn!(error = %e, "memory tool registration failed during toggle");
-                            }
-                            *self.memory.storage.borrow_mut() = Some(storage);
-                            "Memory enabled for this session.".to_owned()
-                        }
-                    } else {
-                        "Memory cannot be enabled (not configured for this session).".to_owned()
-                    }
-                } else if !enabled && self.memory.is_enabled() {
-                    let bridge = self.agent.borrow().tool_bridge().clone();
-                    if !bridge.unregister_tool_by_name(
-                        xai_grok_tools::implementations::memory::MEMORY_SEARCH_TOOL_NAME,
-                    ) {
-                        tracing::debug!("memory_search tool was not registered during unregister");
-                    }
-                    if !bridge.unregister_tool_by_name(
-                        xai_grok_tools::implementations::memory::MEMORY_GET_TOOL_NAME,
-                    ) {
-                        tracing::debug!("memory_get tool was not registered during unregister");
-                    }
-                    *self.memory.storage.borrow_mut() = None;
-                    *self.memory.search_counter.borrow_mut() = None;
-                    "Memory disabled for this session.".to_owned()
-                } else {
-                    let state = if enabled { "enabled" } else { "disabled" };
-                    format!("Memory is already {state}.")
-                };
-                self.send_slash_command_output(&msg).await;
-                self.refresh_goal_harness_enabled().await;
-                ok_end_turn(0, None)
-            }
-            // GoalSet is handled directly in handle_prompt (before this
-            // function is called) so the turn flows through to model inference
-            // instead of ending immediately.
+            // GoalSet is handled directly in handle_prompt, before this function is called
+            // The turn then flows through to model inference instead of ending immediately
             BuiltinAction::GoalSet { .. } => {
                 unreachable!("GoalSet is intercepted in handle_prompt")
+            }
+            BuiltinAction::DeepResearch { query } => {
+                if query.is_empty() {
+                    self.send_host_turn_slash_command_output(
+                        "Usage: /deep-research <query>\nResearch with bounded parallel agents, \
+                         independently cross-check the evidence, and write a concise cited report.",
+                    )
+                    .await;
+                    return ok_end_turn(0, None);
+                }
+                let resolved = match crate::session::workflow::registry::resolve_by_name(
+                    "deep-research",
+                    None,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.send_host_turn_slash_command_output(&format!(
+                            "deep-research workflow unavailable: {e}"
+                        ))
+                        .await;
+                        return ok_end_turn(0, None);
+                    }
+                };
+                let spec = crate::session::workflow::manager::LaunchSpec {
+                    objective: query.clone(),
+                    args: serde_json::json!({ "query": query }),
+                    agent_budget: None,
+                    effort: None,
+                    resume_run_id: None,
+                };
+                let launched = self.workflow_manager.lock().await.launch(resolved, spec);
+                match launched {
+                    Ok((run_id, outcome_rx)) => {
+                        let (display, objective) = self
+                            .workflow_tracker()
+                            .await
+                            .lock()
+                            .get(&run_id)
+                            .map(|r| (r.name.clone(), r.objective.clone()))
+                            .unwrap_or_else(|| ("deep-research".to_string(), String::new()));
+                        self.push_workflow_launch_reminder(
+                            &display,
+                            &run_id,
+                            &objective,
+                            &format!("/deep-research {objective}"),
+                            false,
+                        );
+                        self.send_host_turn_slash_command_output(&format!(
+                            "Deep research '{display}' started in the background. It will \
+                             cross-check candidate claims and return a concise cited report here. \
+                             Use /workflow runs to follow progress."
+                        ))
+                        .await;
+                        tokio::spawn(async move {
+                            if let Ok(outcome) = outcome_rx.await {
+                                tracing::info!(run_id, ?outcome, "deep-research finished");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        self.send_host_turn_slash_command_output(&format!(
+                            "Could not start deep research: {e}"
+                        ))
+                        .await;
+                    }
+                }
+                ok_end_turn(0, None)
+            }
+            BuiltinAction::WorkflowManage { run_id, op } => {
+                let msg = self.manage_workflow_run(&run_id, &op).await;
+                self.send_host_turn_slash_command_output(&msg).await;
+                ok_end_turn(0, None)
+            }
+            BuiltinAction::WorkflowLaunch { name, input } => {
+                let (registry, _) = self.named_workflow_snapshot();
+                let msg = self.launch_named_workflow(&registry, &name, &input).await;
+                self.send_host_turn_slash_command_output(&msg).await;
+                ok_end_turn(0, None)
             }
             BuiltinAction::GoalStatus => {
                 let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
                 let goal_tokens = self.goal_tokens_used(current_tokens);
                 let msg = {
                     let mut tracker = self.goal_tracker.lock();
-                    // Flush pending wall-clock delta so elapsed_ms is up to date.
                     tracker.account_elapsed();
                     match tracker.snapshot() {
-                        Some(o) => {
-                            let phase = format!("{:?}", o.phase);
-                            let status = format!("{:?}", o.status);
-                            let elapsed =
-                                crate::session::goal_orchestrator::format_elapsed(o.elapsed_ms);
-                            // `goal_tokens` already includes live subagent
-                            // spend via the token records — no live fold-in.
-                            let mut buf = format!(
-                                "Goal: {}\n\
-                                 Status: {status} | Phase: {phase}\n\
-                                 Tokens used: {goal_tokens}\n\
-                                 Elapsed: {elapsed}",
-                                o.objective,
-                            );
-                            if let Some(budget) = o.token_budget {
-                                buf.push_str(&format!(" | Budget: {budget}"));
-                            }
-                            if let Some(ref role) = o.current_subagent_role {
-                                buf.push_str(&format!("\nActive subagent: {role}"));
-                            }
-                            buf
-                        }
+                        Some(goal) => format!(
+                            "Goal: {}\nStatus: {:?} | Phase: {:?}\nGoal tokens used: {}\nElapsed: {}",
+                            goal.objective,
+                            goal.status,
+                            goal.phase,
+                            goal_tokens,
+                            crate::session::goal_orchestrator::format_elapsed(goal.elapsed_ms),
+                        ),
                         None => "No goal is currently set. Use /goal <objective> to start one."
                             .to_string(),
                     }
                 };
-                self.send_slash_command_output(&msg).await;
+                self.send_host_turn_slash_command_output(&msg).await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::GoalPause => {
@@ -838,62 +861,59 @@ impl SessionActor {
                     let mut tracker = self.goal_tracker.lock();
                     match tracker.status() {
                         Some(GoalStatus::Active) => {
-                            debug_assert!(
-                                tracker.pause(GoalPauseReason::User),
-                                "Active goal must pause"
-                            );
+                            tracker.pause(GoalPauseReason::User);
                             ("Goal paused. Use /goal resume to continue.", true)
                         }
-                        Some(
-                            GoalStatus::UserPaused
-                            | GoalStatus::BackOffPaused
-                            | GoalStatus::NoProgressPaused
-                            | GoalStatus::InfraPaused
-                            | GoalStatus::Blocked,
-                        ) => ("Goal is already paused.", false),
+                        Some(status) if status.is_paused() => ("Goal is already paused.", false),
                         Some(GoalStatus::Complete) => ("Goal is already complete.", false),
                         Some(GoalStatus::BudgetLimited) => ("Goal is budget-limited.", false),
                         None => ("No goal is currently set.", false),
+                        Some(_) => ("Goal is not active.", false),
                     }
                 };
                 if changed {
                     self.clear_pending_classifier_completions();
-                    let (tokens_used, finished_marginal) = self.goal_tokens(current_tokens);
-                    let notify = self.goal_notify_sender();
-                    notify.emit_goal_updated(
+                    let (tokens_used, finished) = self.goal_tokens(current_tokens);
+                    self.goal_notify_sender().emit_goal_updated(
                         &mut self.goal_tracker.lock(),
                         tokens_used,
-                        finished_marginal,
+                        finished,
                     );
                 }
-                self.send_slash_command_output(msg).await;
+                self.send_host_turn_slash_command_output(msg).await;
                 ok_end_turn(0, None)
             }
-            // GoalResume is intercepted in handle_prompt (like GoalSet) so a
-            // successful resume flows through to inference — see `resume_goal`.
+            // GoalResume is intercepted in handle_prompt (like GoalSet) so a successful resume flows through to inference; see `resume_goal`
             BuiltinAction::GoalResume => {
                 unreachable!("GoalResume is intercepted in handle_prompt")
             }
             BuiltinAction::GoalClear => {
+                let (respond_to, deleted) = tokio::sync::oneshot::channel();
+                if self
+                    .notifications
+                    .persistence_tx
+                    .send(PersistenceMsg::DeleteGoalModeState { respond_to })
+                    .is_err()
+                    || !matches!(deleted.await, Ok(Ok(())))
+                {
+                    self.send_host_turn_slash_command_output(
+                        "Could not durably clear the goal. The goal remains loaded; retry /goal clear.",
+                    )
+                    .await;
+                    return ok_end_turn(0, None);
+                }
                 self.goal_tracker.lock().clear();
-                // `/goal clear` is a deliberate user reset — drop both
-                // streaks so stale counters from the previous goal
-                // can't leak into the next one.
                 self.goal_continuation_streak
                     .store(0, std::sync::atomic::Ordering::Relaxed);
                 self.goal_blocked_streak
                     .store(0, std::sync::atomic::Ordering::Relaxed);
-                // Drop goal-turn-origin task ids so a future goal's drain
-                // doesn't suppress the next goal's (or post-goal) tasks.
                 self.goal_turn_task_ids.lock().clear();
-                // Clear per-subagent token records so stale entries
-                // from the previous goal don't leak into the next.
                 self.subagent_token_records.lock().clear();
                 self.clear_pending_classifier_completions();
-                // Emit a cleared notification so the pager drops goal state.
-                let update = crate::session::goal_orchestrator::build_goal_cleared();
-                self.send_xai_notification(update).await;
-                self.send_slash_command_output("Goal cleared.").await;
+                self.send_xai_notification(crate::session::goal_orchestrator::build_goal_cleared())
+                    .await;
+                self.send_host_turn_slash_command_output("Goal cleared.")
+                    .await;
                 ok_end_turn(0, None)
             }
         }
@@ -901,18 +921,32 @@ impl SessionActor {
 
     async fn execute_feedback_command(self: &Arc<Self>, text: String) -> PromptTurnResult {
         if text.is_empty() {
-            self.send_slash_command_output("Usage: /feedback <text>")
+            self.send_host_turn_slash_command_output("Usage: /feedback <text>")
                 .await;
             return ok_end_turn(0, None);
         }
 
-        let (sampling_config, model_metadata, credentials) = tokio::join!(
+        let (sampling_config, model_metadata, credentials, conv) = tokio::join!(
             self.chat_state_handle.get_sampling_config(),
             self.chat_state_handle.get_last_model_metadata(),
             self.chat_state_handle.get_credentials(),
+            self.chat_state_handle.get_conversation(),
         );
-        let model_id = sampling_config.map(|c| c.model);
-        let resolved_model_id = model_metadata.resolved_model_id;
+        let live_model_id = sampling_config.map(|c| c.model);
+        let rated = slash_feedback_rated_turn(&conv);
+        let reasoning_effort = rated.reasoning_effort.map(|e| e.to_string());
+        let (model_id, resolved_model_id) = match rated.model_id {
+            Some(rated_id) => {
+                if model_metadata.resolved_model_id.as_ref() == Some(&rated_id) {
+                    (live_model_id, model_metadata.resolved_model_id)
+                } else if live_model_id.as_ref() != Some(&rated_id) {
+                    (Some(rated_id), None)
+                } else {
+                    (live_model_id, model_metadata.resolved_model_id)
+                }
+            }
+            None => (live_model_id, model_metadata.resolved_model_id),
+        };
         let client_version = credentials.client_version;
 
         use crate::session::feedback_manager::{SessionFeedbackData, SubmitOutcome};
@@ -923,6 +957,7 @@ impl SessionActor {
                 SessionFeedbackData {
                     model_id,
                     resolved_model_id,
+                    reasoning_effort,
                     client_version,
                     session_cwd: self.session_info.cwd.clone(),
                 },
@@ -933,18 +968,18 @@ impl SessionActor {
 
         match outcome {
             SubmitOutcome::Submitted => {
-                self.send_slash_command_output("Feedback submitted. Thank you!")
+                self.send_host_turn_slash_command_output("Feedback submitted. Thank you!")
                     .await;
             }
             SubmitOutcome::LocalOnly => {
-                self.send_slash_command_output(
+                self.send_host_turn_slash_command_output(
                     "Feedback saved locally; no feedback server is configured for this session.",
                 )
                 .await;
             }
             SubmitOutcome::Failed(err) => {
                 tracing::warn!(error = %err, "feedback submission failed");
-                self.send_slash_command_output(
+                self.send_host_turn_slash_command_output(
                     "Feedback saved locally; submitting to the server failed (see logs).",
                 )
                 .await;
@@ -953,4 +988,12 @@ impl SessionActor {
 
         ok_end_turn(0, None)
     }
+}
+
+pub(super) fn slash_feedback_rated_turn(
+    conversation: &[xai_grok_sampling_types::ConversationItem],
+) -> super::FeedbackTurnLookup {
+    super::slash_feedback_last_turn(conversation)
+        .map(|n| super::turn_texts_for_feedback(conversation, n))
+        .unwrap_or_default()
 }

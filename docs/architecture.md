@@ -2,7 +2,7 @@
 
 > 本文件基于仓库 `crates/` 下源码结构、根 `Cargo.toml` 以及 `README.md` 整理，描述 Grok Build（`grok` CLI/TUI）的整体架构、核心数据流与 crate 职责。
 >
-> 已跟随上游最新代码（`upstream/main` @ `37949780`，合并提交 `58753ea`）更新。
+> 已跟随上游最新代码（`origin/main` @ `caf2059e`，含 6 次 monorepo 同步：memory v2 生命周期、prompt offload、agent MCP、权限重构、telemetry 重组等）更新。
 
 ---
 
@@ -216,7 +216,7 @@ flowchart LR
 关键节点：
 
 1. **Tool prep**：`prepare_tool_definitions_timed` 从 `Agent::ToolBridge` 收集工具定义（内置 + MCP），按会话可见性过滤。
-2. **Request build**：`ChatStateHandle::build_request` 组装历史消息与工具定义；涉及 image budget 等上下文预算控制。
+2. **Request build**：`ChatStateHandle::build_request` 组装历史消息与工具定义；涉及 image budget 等上下文预算控制，并可经 prompt offload（`prompt_offload.rs`）按读取窗口预算裁剪/卸载长提示、保留尾部问题。
 3. **Sampling**：`xai-grok-sampler` 采用三层 API——`SamplingClient`（原始 chunk 流）→ `stream` 变换（`stream_chat_completions` / `stream_responses` / `stream_messages`）→ `SamplerHandle`（actor 化：重试、取消、事件协调）。支持 401 归属（`attribution`）与 doom-loop 恢复。
 4. **Tool execution**：`execute_tool_calls` 并发调度；同一路径写操作串行化；`tool_dispatch.rs` 负责权限门控后的实际分发。
 5. **Recovery**：401 触发 `RefreshAuthAndResubmit`（走 `AuthManager` 刷新链）；上下文窗口超限触发 `CompactAndResubmit`（按 `CompactionMode` 落盘压缩段）；Length-truncated 轮次（`max_prompt_tokens` / `max_time_limit`）**先执行已完成工具调用**再结束，而非直接失败。
@@ -357,6 +357,7 @@ sequenceDiagram
 3. `attempt_store`（codec/decoder/intent/recovery/rewind）持久化派生尝试，支持断点恢复与回退。
 4. 父会话通过 `child_tool_projection` 把子 Agent 的工具调用投影回父视图；`prompt_turn_receipt` 记录派生完成的回执。
 5. `waterfall` 模块在 `GROK_SUBAGENT_WATERFALL=1` 时输出单调时钟标记，供回归测试解析。
+6. 协调层新增配额/目标/根控制与模型策略（`task/coordinator/{agent_quotas, agent_targets, root_targets, model_policy}.rs`、`root_control.rs`），并支持子 Agent handoff（`subagent_handoff.rs`）、父会话插断（`parent_interject.rs`）与中断轮次处理（`interrupted_turn.rs`）。
 
 会话 Recap（`/recap`）与旁路调用：
 
@@ -444,7 +445,7 @@ Goal 模式（`/goal`）：
 - **VCS**：Git status、diff、stage、commit、checkout、stash、分支、检查点（`xai-gix-status` 提供 git status 解析）。
 - **执行**：每个 `WorkspaceSession` 持有会话级 `TerminalBackend`（`xai-grok-shell-terminal` 提供 Local/ACP/PTY 运行器；`ptyctl` 提供 PTY 控制），执行 bash、后台任务、监控、定时任务。
 - **检查点/回滚**：`FileStateTracker` 捕获提示前后快照（`xai-hunk-tracker` 跟踪 hunk）；`rewind_to` 恢复文件、hunk、git 状态；`rewind_points.jsonl` 持久化撤销点。
-- **权限**：`CapabilityMode` 按 `ToolKind` 过滤工具；权限管理器处理自动/询问/YOLO 模式。
+- **权限**：`CapabilityMode` 按 `ToolKind` 过滤工具；权限模型重构为 grants（`grants.rs`）+ hub gate（`hub_gate.rs`），新增 bash 权限脚本（`bash_permission_script.rs`）与 manager/policy 的 bash 策略子模块（`manager/bash_policy_allow.rs`、`policy/bash_commands.rs`），仍处理自动/询问/YOLO 模式。
 - **沙箱**：`xai-grok-sandbox` 提供 `workspace` / `read-only` / `strict` / `devbox` 内置 profile（Landlock/Seatbelt），子进程由内核强制限制。
 - **工作区服务器**：`xai-grok-workspace-daemon` 负责 workspace-server 守护进程化（double-fork + pidfile）与预览代理监督；`xai-grok-diag-server` 提供进程内 `/ready`、`/statusz`、`/logs` 诊断端点。
 
@@ -500,6 +501,7 @@ Goal 模式（`/goal`）：
 - **durable observation capture**（`v2_capture.rs`）与安全文件枚举（`storage_v2.rs`，只暴露经受控列举的文件）。
 - 检索来源区分（`observation.rs` 的 `MemorySearchSource`：`Tool` / `Injection` / `CompactionRecovery`）与 `MemoryRetrievalMode`；新增 `query_expansion`、`schema`。
 - 配套安全契约：isolated memory filesystem（工具侧 `memory_v2.rs`）。
+- **生命周期扩展**（新增）：`v2_consolidation.rs`（持久化计划/声明归并，失败回退确定性新 claim）、`v2_maintenance.rs`（tombstone 对账、`forget` 哈希删除+大小上限）、`v2_carryover.rs`（legacy Dream 输出折叠归入 v2 topic）、`v2_clock.rs`（非负 Unix 秒时钟）；会话侧新增 `memory_control.rs`/`memory_forget.rs`/`memory_carryover.rs`/`v2_memory_dream.rs`。
 
 #### 工作流与 Dashboard
 
@@ -529,10 +531,11 @@ Agent Dashboard（`grok dashboard` / `/dashboard` / `Ctrl+\`）：列出本进�
 | `xai-dirs` | 家目录 / `GROK_HOME` 解析；`home_dir()` 是**唯一** home 解析入口（`std::env::home_dir`：Unix `HOME`、Windows `USERPROFILE`，不用 `dirs` 的 known-folder API，避免 `~/.grok` 与其他点目录落在不同树）；dunce 规范化、进程级缓存、`GrokHomeSource` 溯源；由原 `xai-grok-home` 更名而来 |
 | `xai-grok-auth` | 认证抽象：`AuthCredentialProvider`、`HttpAuth`；OIDC/设备码流、刷新链、锁与并发刷新 |
 | `xai-grok-http` | 进程级共享 `reqwest` 客户端、User-Agent 构造 |
-| `xai-grok-telemetry` | 产品事件、Mixpanel、Sentry、OpenTelemetry、会话指标、进程身份（入口点/交互性） |
+| `xai-grok-telemetry` | 产品事件、Mixpanel、Sentry、OpenTelemetry、会话指标、进程身份（入口点/交互性）；内部重组为 events/logs/spans/process/session 模块树 |
 | `xai-grok-secrets` | 敏感信息脱敏：token、用户路径、URL 敏感部分 |
 | `xai-grok-extra-ca` | TLS 策略：OS 根 + Mozilla 根 + 可选 `GROK_EXTRA_CA_BUNDLE` 额外根，固定 rustls |
-| `xai-grok-mcp` | MCP 服务器隔离运行、OAuth、transport、工具调用（隔离 `rmcp` 与 `reqwest` 版本）；支持 2026-07-28 elicitation（多轮往返请求）与 bind-time MCP 服务器；OAuth 认证移出 session spawn 路径 |
+| `xai-grok-file-lock` | 文件锁（多进程共享文件的互斥/串行化） |
+| `xai-grok-mcp` | MCP 服务器隔离运行、OAuth、transport、工具调用（隔离 `rmcp` 与 `reqwest` 版本）；支持 2026-07-28 elicitation（多轮往返请求）与 bind-time MCP 服务器；OAuth 认证移出 session spawn 路径；Agent 级 MCP 解析（`session/agent_mcp.rs`：目录信任/插件忽略、managed policy 与 `enabled=false`/`disabled_mcp_servers` 禁用开关、named lookup 预 overlay 合并） |
 | `xai-grok-hooks` | `~/.grok/hooks/` 与工作树 `.grok/hooks/` 的 hook 系统（command/http runner、trust、matcher） |
 | `xai-grok-subagent-resolution` | 子 Agent 启动规范解析与 resume identity 校验 |
 | `xai-grok-voice` | 流式语音听写 |
@@ -870,6 +873,27 @@ recap、`/btw`、Tab 补全等"次要模型调用"被设计成一套精密的独
 - 语音听写（CLI/TUI）在光标位置插入；bash 模式显示完整 UI 输出；设置单选支持双击。
 - 主题别名在 `/theme` 选择器中可匹配；bot relay 允许 listener connect 命令。
 
+### 13.4 `caf2059e`（2026-09-25）— memory v2 生命周期、prompt offload、agent MCP 与横切重构
+
+相比 `37949780` 的 6 次 monorepo 同步，本次主要变化：
+
+**记忆 v2 生命周期扩展**（§6.4）
+- `v2_consolidation.rs`（持久化计划/声明归并，失败回退确定性新 claim）、`v2_maintenance.rs`（tombstone 对账、`forget` 哈希删除+大小上限）、`v2_carryover.rs`（legacy Dream 输出折叠归入 v2 topic）、`v2_clock.rs`（非负 Unix 秒时钟）。
+- 会话侧新增 `memory_control.rs` / `memory_forget.rs` / `memory_carryover.rs` / `v2_memory_dream.rs`。
+
+**新特性**
+- **Prompt offload**（§5.2）：按读取窗口预算裁剪/卸载长提示，保留尾部问题、分配查询与上下文头部预算（`prompt_offload.rs`）。
+- **Agent 级 MCP**（§7）：目录信任/插件忽略解析、managed policy 与 `enabled=false`/`disabled_mcp_servers` 禁用开关、named lookup 预 overlay 合并（`agent_mcp.rs`）。
+
+**权限模型重构**（§6.3）
+- manager/grant 概念重组为 grants（`grants.rs`）+ hub gate（`hub_gate.rs`）；新增 bash 权限脚本（`bash_permission_script.rs`）与 manager/policy 的 bash 策略子模块。
+
+**横切重构 / 新 crate**
+- **telemetry 内部重组**：43 个新模块，拆为 events/logs/spans/process/session 树（§7）。
+- 新增 `xai-grok-file-lock` crate（文件锁）（§7）。
+- 子 Agent 协调增强：配额/目标/根控制/模型策略（`task/coordinator/*`）、handoff、父会话插断（`parent_interject.rs`）、中断轮次处理（`interrupted_turn.rs`）、长推理提醒（`long_reasoning_reminder.rs`）（§6.2）。
+- bot relay 扩展：新增 `error_command_rejected_*` 命令/事件契约。
+
 ---
 
-*文档生成时间：2026-09-09（已合并上游 `upstream/main` @ `37949780`）*
+*文档生成时间：2026-09-25（已合并上游 origin/main @ caf2059e）*
